@@ -18,7 +18,11 @@ def main() -> int:
         return 2
 
     try:
-        asyncio.run(export_guild(config, DiscordGuildSource(config.token)))
+        asyncio.run(
+            export_guild(
+                config, DiscordGuildSource(config.token, config.request_policy)
+            )
+        )
     except (discord.DiscordException, ValueError) as error:
         print(f"Discord export failed: {error}", file=sys.stderr)
         return 1

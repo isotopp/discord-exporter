@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from typing import Any
+
 import discord
+
+from .request_policy import RequestPolicy
 
 
 class DiscordGuildSource:
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, request_policy: RequestPolicy) -> None:
         self.token = token
+        self.request_policy = request_policy
 
     async def fetch_guild(self, guild_id: int) -> dict[str, object]:
-        client = discord.Client(intents=discord.Intents.none())
+        client = self._client(discord.Intents.none())
         try:
             await client.login(self.token)
             guild = await client.fetch_guild(guild_id)
@@ -30,7 +35,7 @@ class DiscordGuildSource:
     async def fetch_members(self, guild_id: int) -> list[dict[str, object]]:
         intents = discord.Intents.none()
         intents.members = True
-        client = discord.Client(intents=intents)
+        client = self._client(intents)
         try:
             await client.login(self.token)
             guild = await client.fetch_guild(guild_id)
@@ -42,7 +47,7 @@ class DiscordGuildSource:
             await client.close()
 
     async def fetch_channels(self, guild_id: int) -> list[dict[str, object]]:
-        client = discord.Client(intents=discord.Intents.none())
+        client = self._client(discord.Intents.none())
         try:
             await client.login(self.token)
             guild = await client.fetch_guild(guild_id)
@@ -65,7 +70,7 @@ class DiscordGuildSource:
             await client.close()
 
     async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
-        client = discord.Client(intents=discord.Intents.none())
+        client = self._client(discord.Intents.none())
         try:
             await client.login(self.token)
             channel = await client.fetch_channel(channel_id)
@@ -81,7 +86,7 @@ class DiscordGuildSource:
     async def fetch_messages_after(
         self, channel_id: int, after_message_id: str
     ) -> list[dict[str, object]]:
-        client = discord.Client(intents=discord.Intents.none())
+        client = self._client(discord.Intents.none())
         try:
             await client.login(self.token)
             channel = await client.fetch_channel(channel_id)
@@ -97,6 +102,21 @@ class DiscordGuildSource:
             return messages
         finally:
             await client.close()
+
+    def _client(self, intents: discord.Intents) -> discord.Client:
+        client = discord.Client(intents=intents)
+        client.http.user_agent = self.request_policy.user_agent
+        original_request = client.http.request
+
+        async def paced_request(*args: Any, **kwargs: Any) -> Any:
+            await self.request_policy.before_request()
+            session = getattr(client.http, "_HTTPClient__session", None)
+            if session is not None:
+                session.headers.update(self.request_policy.headers)
+            return await original_request(*args, **kwargs)
+
+        setattr(client.http, "request", paced_request)  # noqa: B010
+        return client
 
 
 def _role_record(role: discord.Role) -> dict[str, object]:
