@@ -33,3 +33,6 @@ pip-wheel-metadata/
 
 # macOS
 .DS_Store
+
+# Out export
+/export
