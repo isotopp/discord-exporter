@@ -180,7 +180,59 @@ def _message_record(message: discord.Message) -> dict[str, object]:
         "author_id": message.author.id,
         "created_at": message.created_at.isoformat(),
         "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+        "message_type": message.type.name,
         "content": message.content,
+        "reference": message.reference.to_dict() if message.reference else None,
+        "mentions": [_user_reference(user) for user in message.mentions],
+        "mention_roles": [role.id for role in message.role_mentions],
+        "mention_channels": [channel.id for channel in message.channel_mentions],
+        "mention_everyone": message.mention_everyone,
+        "embeds": [embed.to_dict() for embed in message.embeds],
+        "reactions": [_reaction_record(reaction) for reaction in message.reactions],
+        "attachments": [attachment.to_dict() for attachment in message.attachments],
+        "stickers": [_sticker_record(sticker) for sticker in message.stickers],
+        "pinned": message.pinned,
+        "tts": message.tts,
+        "flags": message.flags.value,
+    }
+
+
+def _user_reference(user: discord.User | discord.Member) -> dict[str, object]:
+    return {
+        "id": user.id,
+        "username": user.name,
+        "global_name": user.global_name,
+        "display_name": user.display_name,
+    }
+
+
+def _reaction_record(reaction: discord.Reaction) -> dict[str, object]:
+    emoji = reaction.emoji
+    emoji_record: object = (
+        emoji
+        if isinstance(emoji, str)
+        else {
+            "id": emoji.id,
+            "name": emoji.name,
+            "animated": emoji.animated,
+        }
+    )
+    return {
+        "emoji": emoji_record,
+        "count": reaction.count,
+        "me": reaction.me,
+        "normal_count": reaction.normal_count,
+        "burst_count": reaction.burst_count,
+        "me_burst": reaction.me_burst,
+    }
+
+
+def _sticker_record(sticker: discord.StickerItem) -> dict[str, object]:
+    return {
+        "id": sticker.id,
+        "name": sticker.name,
+        "format": sticker.format.name,
+        "url": sticker.url,
     }
 
 

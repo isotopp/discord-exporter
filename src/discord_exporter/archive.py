@@ -77,7 +77,14 @@ def _stringify_ids(value: object, key: str | None = None) -> object:
 
 
 def _is_id_key(key: str | None) -> bool:
-    return bool(key and (key == "id" or key == "roles" or key.endswith("_id")))
+    return bool(
+        key
+        and (
+            key == "id"
+            or key in {"mention_channels", "mention_roles", "roles"}
+            or key.endswith(("_id", "_ids"))
+        )
+    )
 
 
 def _member_records(

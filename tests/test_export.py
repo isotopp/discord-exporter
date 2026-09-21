@@ -130,6 +130,39 @@ class OffsetMessageGuildSource(MessageGuildSource):
         return await super().fetch_messages(channel_id)
 
 
+class RelationshipMessageGuildSource(ChannelGuildSource):
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return [
+                {
+                    "id": 300,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "edited_at": "2021-01-01T00:01:00+00:00",
+                    "message_type": "default",
+                    "content": "Replying to <@333>",
+                    "reference": {
+                        "message_id": 299,
+                        "channel_id": 100,
+                        "guild_id": 123,
+                    },
+                    "mentions": [{"id": 333, "username": "mentioned"}],
+                    "mention_roles": [789],
+                    "embeds": [{"title": "An embed"}],
+                    "reactions": [{"emoji": {"id": 987, "name": "wave"}, "count": 2}],
+                    "attachments": [
+                        {
+                            "id": 301,
+                            "filename": "evidence.txt",
+                            "url": "https://cdn.example/evidence.txt",
+                        }
+                    ],
+                }
+            ]
+        return await super().fetch_messages(channel_id)
+
+
 class InaccessibleChannelGuildSource(ChannelGuildSource):
     async def fetch_channels(self, guild_id: int) -> list[dict[str, object]]:
         records = await super().fetch_channels(guild_id)
@@ -333,3 +366,41 @@ def test_reexporting_messages_does_not_duplicate_and_uses_utc_year(
         }
     ]
     assert not (root / "channels" / "general--100" / "2021").exists()
+
+
+def test_exporting_messages_preserves_relationships_and_string_ids(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    asyncio.run(export_guild(config, RelationshipMessageGuildSource()))
+
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+    message = json.loads(message_path.read_text().splitlines()[0])
+
+    assert message == {
+        "attachments": [
+            {
+                "filename": "evidence.txt",
+                "id": "301",
+                "url": "https://cdn.example/evidence.txt",
+            }
+        ],
+        "author_id": "111",
+        "channel_id": "100",
+        "content": "Replying to <@333>",
+        "created_at": "2021-01-01T00:00:00+00:00",
+        "edited_at": "2021-01-01T00:01:00+00:00",
+        "embeds": [{"title": "An embed"}],
+        "id": "300",
+        "mention_roles": ["789"],
+        "mentions": [{"id": "333", "username": "mentioned"}],
+        "message_type": "default",
+        "reactions": [{"count": 2, "emoji": {"id": "987", "name": "wave"}}],
+        "reference": {
+            "channel_id": "100",
+            "guild_id": "123",
+            "message_id": "299",
+        },
+    }
