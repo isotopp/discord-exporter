@@ -163,6 +163,48 @@ class MessageMediaGuildSource(ChannelGuildSource):
         return url.encode()
 
 
+class FailedMediaGuildSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.downloads: list[str] = []
+
+    async def fetch_members(self, guild_id: int) -> list[dict[str, object]]:
+        records = await super().fetch_members(guild_id)
+        records[0]["avatar_url"] = "https://cdn.example/avatar-bad"
+        return records
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return [
+                {
+                    "id": 800,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "retain this message",
+                    "attachments": [
+                        {
+                            "id": 801,
+                            "filename": "good.txt",
+                            "url": "https://cdn.example/good",
+                        },
+                        {
+                            "id": 802,
+                            "filename": "bad.txt",
+                            "url": "https://cdn.example/message-bad",
+                        },
+                    ],
+                }
+            ]
+        return await super().fetch_messages(channel_id)
+
+    async def download_media(self, url: str) -> bytes:
+        self.downloads.append(url)
+        if url.endswith("-bad"):
+            raise OSError("media unavailable")
+        return url.encode()
+
+
 class MessageGuildSource(ChannelGuildSource):
     async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
         if channel_id == 100:
@@ -462,6 +504,56 @@ def test_message_media_uses_stable_paths_and_reuses_existing_downloads(
         b"https://cdn.example/701"
     )
     assert (root / embed_path).is_file()
+
+
+def test_media_failures_are_durable_without_blocking_other_media_or_channels(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = FailedMediaGuildSource()
+
+    asyncio.run(export_guild(config, source))
+    asyncio.run(export_guild(config, source))
+
+    members = [
+        json.loads(line) for line in (root / "members.jsonl").read_text().splitlines()
+    ]
+    messages = [
+        json.loads(line)
+        for line in (root / "channels" / "general--100" / "2021" / "messages.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    manifest = json.loads((root / "manifest.json").read_text())
+
+    assert "avatar_download_error" in members[0]
+    assert messages[0]["content"] == "retain this message"
+    assert messages[0]["attachments"][0]["local_path"]
+    assert "download_error" in messages[0]["attachments"][1]
+    assert manifest["status"] == "complete"
+    assert manifest["incomplete_channels"] == []
+    assert manifest["failures"] == [
+        {
+            "kind": "media",
+            "operation": "avatar",
+            "user_id": "111",
+            "url": "https://cdn.example/avatar-bad",
+            "error": "OSError",
+        },
+        {
+            "channel_id": "100",
+            "error": "OSError",
+            "kind": "media",
+            "message_id": "800",
+            "media_id": "802",
+            "operation": "attachment",
+            "url": "https://cdn.example/message-bad",
+        },
+    ]
+    assert source.downloads.count("https://cdn.example/good") == 1
+    assert source.downloads.count("https://cdn.example/avatar-bad") == 2
+    assert source.downloads.count("https://cdn.example/message-bad") == 2
 
 
 def test_exporting_channels_keeps_ids_stable_when_a_channel_is_renamed(

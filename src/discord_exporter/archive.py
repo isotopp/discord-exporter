@@ -52,6 +52,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     if not isinstance(channel_states, dict):
         raise TypeError("Archive state has invalid channel entries")
 
+    media_failures: list[dict[str, str]] = []
     members = await _download_member_avatars(
         _member_records(
             await _with_retries(
@@ -61,6 +62,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
         source,
         config.export_root,
         request_policy.sleep,
+        media_failures,
     )
     channels = _channel_records(
         await _with_retries(
@@ -72,7 +74,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
         "channels": _manifest_channels(channels, channel_states),
         "export_finished_at": None,
         "export_started_at": datetime.now(UTC).isoformat(),
-        "failures": [],
+        "failures": media_failures,
         "format_version": 1,
         "incomplete_channels": _incomplete_channel_ids(channels, channel_states),
         "source_guild_id": str(config.guild_id),
@@ -109,6 +111,8 @@ async def export_guild(config: Config, source: GuildSource) -> None:
                     config.export_root,
                     source,
                     request_policy.sleep,
+                    media_failures,
+                    channel_id,
                 )
                 _write_message_files(
                     config.export_root / str(channel["archive_path"]),
@@ -165,6 +169,7 @@ async def _download_member_avatars(
     source: GuildSource,
     export_root: Path,
     sleep: Callable[[float], Awaitable[None]],
+    failures: list[dict[str, str]],
 ) -> list[Mapping[str, object]]:
     avatars_root = export_root / "media" / "avatars"
     enriched_members: list[Mapping[str, object]] = []
@@ -176,14 +181,33 @@ async def _download_member_avatars(
             avatar_id = str(member.get("avatar") or "avatar")
             suffix = Path(urlparse(avatar_url).path).suffix or ".bin"
             avatar_path = avatars_root / f"{member_id}--{avatar_id}{suffix}"
-            if not avatar_path.is_file():
-                avatar_path.write_bytes(
-                    await _with_retries(
-                        lambda avatar_url=avatar_url: source.download_media(avatar_url),
-                        sleep,
+            try:
+                if not avatar_path.is_file():
+                    avatar_path.write_bytes(
+                        await _with_retries(
+                            lambda avatar_url=avatar_url: source.download_media(
+                                avatar_url
+                            ),
+                            sleep,
+                        )
                     )
+                enriched["avatar_path"] = avatar_path.relative_to(
+                    export_root
+                ).as_posix()
+            except (discord.DiscordException, OSError) as error:
+                enriched["avatar_download_error"] = {
+                    "url": avatar_url,
+                    "error": type(error).__name__,
+                }
+                failures.append(
+                    {
+                        "kind": "media",
+                        "operation": "avatar",
+                        "user_id": member_id,
+                        "url": avatar_url,
+                        "error": type(error).__name__,
+                    }
                 )
-            enriched["avatar_path"] = avatar_path.relative_to(export_root).as_posix()
         enriched_members.append(enriched)
     return enriched_members
 
@@ -194,6 +218,8 @@ async def _download_message_media(
     export_root: Path,
     source: GuildSource,
     sleep: Callable[[float], Awaitable[None]],
+    failures: list[dict[str, str]],
+    channel_id: str,
 ) -> dict[int, list[Mapping[str, object]]]:
     enriched_messages: dict[int, list[Mapping[str, object]]] = {}
     for year, records in messages.items():
@@ -213,6 +239,8 @@ async def _download_message_media(
                         export_root,
                         source,
                         sleep,
+                        failures,
+                        channel_id,
                         index,
                     )
                     for index, attachment in enumerate(attachments)
@@ -227,6 +255,8 @@ async def _download_message_media(
                         export_root,
                         source,
                         sleep,
+                        failures,
+                        channel_id,
                     )
                     for embed in embeds
                 ]
@@ -242,6 +272,8 @@ async def _download_attachment(
     export_root: Path,
     source: GuildSource,
     sleep: Callable[[float], Awaitable[None]],
+    failures: list[dict[str, str]],
+    channel_id: str,
     index: int,
 ) -> object:
     if not isinstance(attachment, Mapping):
@@ -255,11 +287,28 @@ async def _download_attachment(
         Path(str(attachment.get("filename") or "attachment")).name
     )
     path = media_root / f"{message_id}--{attachment_id}--{filename}"
-    if not path.is_file():
-        path.write_bytes(
-            await _with_retries(lambda url=url: source.download_media(url), sleep)
+    try:
+        if not path.is_file():
+            path.write_bytes(
+                await _with_retries(lambda url=url: source.download_media(url), sleep)
+            )
+        enriched["local_path"] = path.relative_to(export_root).as_posix()
+    except (discord.DiscordException, OSError) as error:
+        enriched["download_error"] = {
+            "url": url,
+            "error": type(error).__name__,
+        }
+        failures.append(
+            {
+                "channel_id": channel_id,
+                "error": type(error).__name__,
+                "kind": "media",
+                "message_id": message_id,
+                "media_id": attachment_id,
+                "operation": "attachment",
+                "url": url,
+            }
         )
-    enriched["local_path"] = path.relative_to(export_root).as_posix()
     return enriched
 
 
@@ -270,6 +319,8 @@ async def _download_embed_images(
     export_root: Path,
     source: GuildSource,
     sleep: Callable[[float], Awaitable[None]],
+    failures: list[dict[str, str]],
+    channel_id: str,
 ) -> object:
     if not isinstance(embed, Mapping):
         return embed
@@ -284,12 +335,31 @@ async def _download_embed_images(
         asset_id = hashlib.sha256(url.encode()).hexdigest()[:16]
         suffix = Path(urlparse(url).path).suffix or ".bin"
         path = media_root / f"{message_id}--embed-{asset_id}{suffix}"
-        if not path.is_file():
-            path.write_bytes(
-                await _with_retries(lambda url=url: source.download_media(url), sleep)
-            )
         enriched_image = dict(image)
-        enriched_image["local_path"] = path.relative_to(export_root).as_posix()
+        try:
+            if not path.is_file():
+                path.write_bytes(
+                    await _with_retries(
+                        lambda url=url: source.download_media(url), sleep
+                    )
+                )
+            enriched_image["local_path"] = path.relative_to(export_root).as_posix()
+        except (discord.DiscordException, OSError) as error:
+            enriched_image["download_error"] = {
+                "url": url,
+                "error": type(error).__name__,
+            }
+            failures.append(
+                {
+                    "channel_id": channel_id,
+                    "error": type(error).__name__,
+                    "kind": "media",
+                    "message_id": message_id,
+                    "media_id": asset_id,
+                    "operation": "embed_image",
+                    "url": url,
+                }
+            )
         enriched[key] = enriched_image
     return enriched
 
