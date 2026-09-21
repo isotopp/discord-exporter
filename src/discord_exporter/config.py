@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 
 
 class ConfigurationError(ValueError):
@@ -32,16 +32,18 @@ def load_env(
         local_file if local_file.is_file() else home_directory / ".discord-export.env"
     )
 
-    values = (
-        {
-            key: value
-            for key, value in dotenv_values(environment_file).items()
-            if value is not None
-        }
-        if environment_file.is_file()
-        else {}
-    )
-    values.update(environ if environ is not None else os.environ)
+    original_environment = dict(os.environ) if environ is not None else None
+    if environ is not None:
+        os.environ.clear()
+        os.environ.update(environ)
+    try:
+        if environment_file.is_file():
+            load_dotenv(environment_file, override=False)
+        values = dict(os.environ)
+    finally:
+        if original_environment is not None:
+            os.environ.clear()
+            os.environ.update(original_environment)
 
     token = values.get("DISCORD_TOKEN", "").strip()
     if not token:
