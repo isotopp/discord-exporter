@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -102,6 +103,13 @@ async def export_guild(config: Config, source: GuildSource) -> None:
                     ),
                     channel_id,
                 )
+                messages = await _download_message_media(
+                    messages,
+                    config.export_root / str(channel["archive_path"]),
+                    config.export_root,
+                    source,
+                    request_policy.sleep,
+                )
                 _write_message_files(
                     config.export_root / str(channel["archive_path"]),
                     messages,
@@ -178,6 +186,120 @@ async def _download_member_avatars(
             enriched["avatar_path"] = avatar_path.relative_to(export_root).as_posix()
         enriched_members.append(enriched)
     return enriched_members
+
+
+async def _download_message_media(
+    messages: Mapping[int, Sequence[Mapping[str, object]]],
+    channel_path: Path,
+    export_root: Path,
+    source: GuildSource,
+    sleep: Callable[[float], Awaitable[None]],
+) -> dict[int, list[Mapping[str, object]]]:
+    enriched_messages: dict[int, list[Mapping[str, object]]] = {}
+    for year, records in messages.items():
+        media_root = channel_path / str(year) / "media"
+        media_root.mkdir(parents=True, exist_ok=True)
+        enriched_year: list[Mapping[str, object]] = []
+        for message in records:
+            message_id = str(message["id"])
+            enriched = dict(message)
+            attachments = message.get("attachments")
+            if isinstance(attachments, list):
+                enriched["attachments"] = [
+                    await _download_attachment(
+                        attachment,
+                        message_id,
+                        media_root,
+                        export_root,
+                        source,
+                        sleep,
+                        index,
+                    )
+                    for index, attachment in enumerate(attachments)
+                ]
+            embeds = message.get("embeds")
+            if isinstance(embeds, list):
+                enriched["embeds"] = [
+                    await _download_embed_images(
+                        embed,
+                        message_id,
+                        media_root,
+                        export_root,
+                        source,
+                        sleep,
+                    )
+                    for embed in embeds
+                ]
+            enriched_year.append(enriched)
+        enriched_messages[year] = enriched_year
+    return enriched_messages
+
+
+async def _download_attachment(
+    attachment: object,
+    message_id: str,
+    media_root: Path,
+    export_root: Path,
+    source: GuildSource,
+    sleep: Callable[[float], Awaitable[None]],
+    index: int,
+) -> object:
+    if not isinstance(attachment, Mapping):
+        return attachment
+    enriched = dict(attachment)
+    url = attachment.get("url")
+    if not isinstance(url, str) or not url:
+        return enriched
+    attachment_id = str(attachment.get("id") or f"attachment-{index}")
+    filename = _safe_media_name(
+        Path(str(attachment.get("filename") or "attachment")).name
+    )
+    path = media_root / f"{message_id}--{attachment_id}--{filename}"
+    if not path.is_file():
+        path.write_bytes(
+            await _with_retries(lambda url=url: source.download_media(url), sleep)
+        )
+    enriched["local_path"] = path.relative_to(export_root).as_posix()
+    return enriched
+
+
+async def _download_embed_images(
+    embed: object,
+    message_id: str,
+    media_root: Path,
+    export_root: Path,
+    source: GuildSource,
+    sleep: Callable[[float], Awaitable[None]],
+) -> object:
+    if not isinstance(embed, Mapping):
+        return embed
+    enriched = dict(embed)
+    for key in ("image", "thumbnail"):
+        image = embed.get(key)
+        if not isinstance(image, Mapping):
+            continue
+        url = image.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        asset_id = hashlib.sha256(url.encode()).hexdigest()[:16]
+        suffix = Path(urlparse(url).path).suffix or ".bin"
+        path = media_root / f"{message_id}--embed-{asset_id}{suffix}"
+        if not path.is_file():
+            path.write_bytes(
+                await _with_retries(lambda url=url: source.download_media(url), sleep)
+            )
+        enriched_image = dict(image)
+        enriched_image["local_path"] = path.relative_to(export_root).as_posix()
+        enriched[key] = enriched_image
+    return enriched
+
+
+def _safe_media_name(name: str) -> str:
+    safe = "".join(
+        character if character.isalnum() or character in ".-_" else "-"
+        for character in name
+    ).strip(".-")
+    return safe or "attachment"
 
 
 def _manifest_channels(

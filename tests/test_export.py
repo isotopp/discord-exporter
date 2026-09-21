@@ -117,6 +117,52 @@ class ChannelGuildSource(MemberGuildSource):
         return []
 
 
+class MessageMediaGuildSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.downloads: list[str] = []
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return [
+                {
+                    "id": 700,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "first file",
+                    "attachments": [
+                        {
+                            "id": 701,
+                            "filename": "same.txt",
+                            "url": "https://cdn.example/701",
+                        }
+                    ],
+                },
+                {
+                    "id": 702,
+                    "channel_id": 100,
+                    "author_id": 222,
+                    "created_at": "2021-01-01T00:01:00+00:00",
+                    "content": "second file",
+                    "attachments": [
+                        {
+                            "id": 703,
+                            "filename": "same.txt",
+                            "url": "https://cdn.example/703",
+                        }
+                    ],
+                    "embeds": [{"image": {"url": "https://cdn.example/embed.png"}}],
+                    "stickers": [{"id": 704, "name": "keep-metadata-only"}],
+                },
+            ]
+        return await super().fetch_messages(channel_id)
+
+    async def download_media(self, url: str) -> bytes:
+        self.downloads.append(url)
+        return url.encode()
+
+
 class MessageGuildSource(ChannelGuildSource):
     async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
         if channel_id == 100:
@@ -385,6 +431,39 @@ def test_member_avatars_are_downloaded_once_and_referenced_relatively(
     ).read_bytes() == b"avatar-bytes"
 
 
+def test_message_media_uses_stable_paths_and_reuses_existing_downloads(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = MessageMediaGuildSource()
+
+    asyncio.run(export_guild(config, source))
+    asyncio.run(export_guild(config, source))
+
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+    messages = [json.loads(line) for line in message_path.read_text().splitlines()]
+
+    assert messages[0]["attachments"][0]["local_path"] == (
+        "channels/general--100/2021/media/700--701--same.txt"
+    )
+    assert messages[1]["attachments"][0]["local_path"] == (
+        "channels/general--100/2021/media/702--703--same.txt"
+    )
+    embed_path = messages[1]["embeds"][0]["image"]["local_path"]
+    assert embed_path.startswith("channels/general--100/2021/media/702--embed-")
+    assert messages[1]["stickers"] == [{"id": "704", "name": "keep-metadata-only"}]
+    assert source.downloads == [
+        "https://cdn.example/701",
+        "https://cdn.example/703",
+        "https://cdn.example/embed.png",
+    ]
+    assert (root / messages[0]["attachments"][0]["local_path"]).read_bytes() == (
+        b"https://cdn.example/701"
+    )
+    assert (root / embed_path).is_file()
+
+
 def test_exporting_channels_keeps_ids_stable_when_a_channel_is_renamed(
     tmp_path: Path,
 ) -> None:
@@ -529,6 +608,9 @@ def test_exporting_messages_preserves_relationships_and_string_ids(
             {
                 "filename": "evidence.txt",
                 "id": "301",
+                "local_path": (
+                    "channels/general--100/2021/media/300--301--evidence.txt"
+                ),
                 "url": "https://cdn.example/evidence.txt",
             }
         ],
@@ -549,6 +631,9 @@ def test_exporting_messages_preserves_relationships_and_string_ids(
             "message_id": "299",
         },
     }
+    assert (
+        root / "channels" / "general--100" / "2021" / "media" / "300--301--evidence.txt"
+    ).read_bytes() == b"media"
 
 
 def test_exporting_messages_performs_a_finite_catch_up_pass(
