@@ -78,6 +78,26 @@ class DiscordGuildSource:
         finally:
             await client.close()
 
+    async def fetch_messages_after(
+        self, channel_id: int, after_message_id: str
+    ) -> list[dict[str, object]]:
+        client = discord.Client(intents=discord.Intents.none())
+        try:
+            await client.login(self.token)
+            channel = await client.fetch_channel(channel_id)
+            if not isinstance(channel, discord.abc.Messageable):
+                return []
+            messages: list[dict[str, object]] = []
+            async for message in channel.history(
+                limit=None,
+                after=discord.Object(id=int(after_message_id)),
+                oldest_first=True,
+            ):
+                messages.append(_message_record(message))
+            return messages
+        finally:
+            await client.close()
+
 
 def _role_record(role: discord.Role) -> dict[str, object]:
     return {

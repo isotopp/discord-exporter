@@ -29,6 +29,12 @@ class EmptyGuildSource:
         assert channel_id == 0
         return []
 
+    async def fetch_messages_after(
+        self, channel_id: int, after_message_id: str
+    ) -> list[dict[str, object]]:
+        assert after_message_id
+        return []
+
 
 class MemberGuildSource(EmptyGuildSource):
     async def fetch_members(self, guild_id: int) -> list[dict[str, object]]:
@@ -161,6 +167,44 @@ class RelationshipMessageGuildSource(ChannelGuildSource):
                 }
             ]
         return await super().fetch_messages(channel_id)
+
+
+class CatchUpMessageGuildSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.catch_up_calls = 0
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return [
+                {
+                    "id": 400,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "historical",
+                }
+            ]
+        return await super().fetch_messages(channel_id)
+
+    async def fetch_messages_after(
+        self, channel_id: int, after_message_id: str
+    ) -> list[dict[str, object]]:
+        if channel_id != 100:
+            return []
+        self.catch_up_calls += 1
+        assert after_message_id == str(399 + self.catch_up_calls)
+        if self.catch_up_calls == 1:
+            return [
+                {
+                    "id": 401,
+                    "channel_id": 100,
+                    "author_id": 222,
+                    "created_at": "2021-01-01T00:01:00+00:00",
+                    "content": "arrived during export",
+                }
+            ]
+        return []
 
 
 class InaccessibleChannelGuildSource(ChannelGuildSource):
@@ -404,3 +448,22 @@ def test_exporting_messages_preserves_relationships_and_string_ids(
             "message_id": "299",
         },
     }
+
+
+def test_exporting_messages_performs_a_finite_catch_up_pass(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = CatchUpMessageGuildSource()
+
+    asyncio.run(export_guild(config, source))
+
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+    assert [
+        json.loads(line)["id"] for line in message_path.read_text().splitlines()
+    ] == [
+        "400",
+        "401",
+    ]
+    assert source.catch_up_calls == 2

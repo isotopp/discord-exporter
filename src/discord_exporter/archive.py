@@ -20,6 +20,10 @@ class GuildSource(Protocol):
         self, channel_id: int
     ) -> Sequence[Mapping[str, object]]: ...
 
+    async def fetch_messages_after(
+        self, channel_id: int, after_message_id: str
+    ) -> Sequence[Mapping[str, object]]: ...
+
 
 async def export_guild(config: Config, source: GuildSource) -> None:
     normalized_guild = _stringify_ids(await source.fetch_guild(config.guild_id))
@@ -39,7 +43,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     for channel in channels:
         if channel.get("accessible", True) is not False:
             messages = _message_records(
-                await source.fetch_messages(int(str(channel["id"]))),
+                await _fetch_channel_messages(source, int(str(channel["id"]))),
                 str(channel["id"]),
             )
             _write_message_files(
@@ -168,6 +172,48 @@ def _message_records(
             key=lambda record: (_message_timestamp(record), str(record["id"]))
         )
     return by_year
+
+
+async def _fetch_channel_messages(
+    source: GuildSource, channel_id: int
+) -> list[Mapping[str, object]]:
+    records = list(await source.fetch_messages(channel_id))
+    seen_ids = {_record_id(record) for record in records}
+    cursor = _latest_message_id(records) or "0"
+    while cursor:
+        newer_records = await source.fetch_messages_after(channel_id, cursor)
+        fresh_records = [
+            record for record in newer_records if _record_id(record) not in seen_ids
+        ]
+        if not fresh_records:
+            break
+        records.extend(fresh_records)
+        seen_ids.update(_record_id(record) for record in fresh_records)
+        cursor = _latest_message_id(records)
+    return records
+
+
+def _record_id(record: Mapping[str, object]) -> str:
+    normalized = _stringify_ids(record)
+    if not isinstance(normalized, Mapping) or not isinstance(normalized.get("id"), str):
+        raise TypeError("Discord returned a message without an ID")
+    return normalized["id"]
+
+
+def _latest_message_id(records: Sequence[Mapping[str, object]]) -> str | None:
+    if not records:
+        return None
+    normalized: list[Mapping[str, object]] = []
+    for record in records:
+        value = _stringify_ids(record)
+        if not isinstance(value, Mapping):
+            raise TypeError("Discord returned an invalid message record")
+        normalized.append(value)
+    latest = max(
+        normalized,
+        key=lambda record: (_message_timestamp(record), _record_id(record)),
+    )
+    return _record_id(latest)
 
 
 def _message_timestamp(record: Mapping[str, object]) -> datetime:
