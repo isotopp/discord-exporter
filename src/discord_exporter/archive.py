@@ -35,20 +35,29 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     config.export_root.mkdir(parents=True, exist_ok=True)
     (config.export_root / "channels").mkdir(exist_ok=True)
     (config.export_root / "media" / "avatars").mkdir(parents=True, exist_ok=True)
+    state_path = config.export_root / "state.json"
+    state = _load_state(state_path)
+    channel_states = state["channels"]
+    if not isinstance(channel_states, dict):
+        raise TypeError("Archive state has invalid channel entries")
 
     members = _member_records(await source.fetch_members(config.guild_id))
     channels = _channel_records(
         await source.fetch_channels(config.guild_id), config.export_root
     )
     for channel in channels:
-        if channel.get("accessible", True) is not False:
+        channel_id = str(channel["id"])
+        if channel.get("accessible", True) is False:
+            channel_states[channel_id] = _incomplete_channel_state()
+        else:
             messages = _message_records(
-                await _fetch_channel_messages(source, int(str(channel["id"]))),
-                str(channel["id"]),
+                await _fetch_channel_messages(source, int(channel_id)), channel_id
             )
             _write_message_files(
                 config.export_root / str(channel["archive_path"]), messages
             )
+            channel_states[channel_id] = _complete_channel_state(messages)
+        _write_state_atomic(state_path, state)
 
     _write_json(config.export_root / "server.json", normalized_guild)
     _write_jsonl(config.export_root / "members.jsonl", members)
@@ -61,13 +70,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
             "status": "in_progress",
         },
     )
-    _write_json(
-        config.export_root / "state.json",
-        {
-            "version": 1,
-            "channels": {},
-        },
-    )
+    _write_state_atomic(state_path, state)
 
 
 def _stringify_ids(value: object, key: str | None = None) -> object:
@@ -233,6 +236,55 @@ def _write_message_files(
         year_path = channel_path / str(year)
         year_path.mkdir(parents=True, exist_ok=True)
         _write_jsonl(year_path / "messages.jsonl", records)
+
+
+def _load_state(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {"version": 1, "channels": {}}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("Archive state has an unsupported format")
+    if not isinstance(value.get("channels"), dict):
+        raise TypeError("Archive state has invalid channel entries")
+    return value
+
+
+def _incomplete_channel_state() -> dict[str, object]:
+    return {
+        "last_message_id": None,
+        "last_message_timestamp": None,
+        "complete": False,
+    }
+
+
+def _complete_channel_state(
+    messages: Mapping[int, Sequence[Mapping[str, object]]],
+) -> dict[str, object]:
+    records = [record for year in messages.values() for record in year]
+    if not records:
+        return {
+            "last_message_id": None,
+            "last_message_timestamp": None,
+            "complete": True,
+        }
+    latest = max(
+        records,
+        key=lambda record: (_message_timestamp(record), _record_id(record)),
+    )
+    timestamp = latest.get("created_at")
+    if not isinstance(timestamp, str):
+        raise TypeError("Discord returned a message without a creation timestamp")
+    return {
+        "last_message_id": _record_id(latest),
+        "last_message_timestamp": timestamp,
+        "complete": True,
+    }
+
+
+def _write_state_atomic(path: Path, state: Mapping[str, object]) -> None:
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    _write_json(temporary_path, state)
+    temporary_path.replace(path)
 
 
 def _write_json(path: Path, value: object) -> None:

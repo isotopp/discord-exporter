@@ -2,6 +2,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from discord_exporter.archive import export_guild
 from discord_exporter.config import Config
 
@@ -467,3 +469,73 @@ def test_exporting_messages_performs_a_finite_catch_up_pass(
         "401",
     ]
     assert source.catch_up_calls == 2
+
+
+def test_exporting_messages_records_global_channel_progress(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    asyncio.run(export_guild(config, MessageGuildSource()))
+
+    assert json.loads((root / "state.json").read_text()) == {
+        "channels": {
+            "100": {
+                "complete": True,
+                "last_message_id": "201",
+                "last_message_timestamp": "2021-01-01T00:00:01+00:00",
+            },
+            "101": {
+                "complete": True,
+                "last_message_id": None,
+                "last_message_timestamp": None,
+            },
+        },
+        "version": 1,
+    }
+
+
+def test_state_replacement_failure_keeps_previous_state_and_durable_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "export"
+    root.mkdir()
+    previous_state = {
+        "channels": {
+            "100": {
+                "complete": False,
+                "last_message_id": "198",
+                "last_message_timestamp": "2020-12-31T23:59:00+00:00",
+            }
+        },
+        "version": 1,
+    }
+    state_path = root / "state.json"
+    state_path.write_text(json.dumps(previous_state), encoding="utf-8")
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    original_replace = Path.replace
+
+    def fail_state_replace(self: Path, target: Path) -> Path:
+        if self.name == ".state.json.tmp":
+            raise OSError("simulated interruption")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_state_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        asyncio.run(export_guild(config, MessageGuildSource()))
+
+    assert json.loads(state_path.read_text()) == previous_state
+    assert (root / "channels" / "general--100" / "2020" / "messages.jsonl").is_file()
+
+    monkeypatch.undo()
+    asyncio.run(export_guild(config, MessageGuildSource()))
+
+    message_ids: list[str] = []
+    for year in ("2020", "2021"):
+        message_path = root / "channels" / "general--100" / year / "messages.jsonl"
+        message_ids.extend(
+            json.loads(line)["id"] for line in message_path.read_text().splitlines()
+        )
+    assert message_ids == ["199", "200", "201"]
