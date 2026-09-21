@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import urllib.request
 from typing import Any
 
 import discord
@@ -103,6 +105,11 @@ class DiscordGuildSource:
         finally:
             await client.close()
 
+    async def download_media(self, url: str) -> bytes:
+        await self.request_policy.before_request()
+        request = urllib.request.Request(url, headers=self.request_policy.headers)
+        return await asyncio.to_thread(_read_url, request)
+
     def _client(self, intents: discord.Intents) -> discord.Client:
         client = discord.Client(intents=intents)
         client.http.user_agent = self.request_policy.user_agent
@@ -132,6 +139,11 @@ def _role_record(role: discord.Role) -> dict[str, object]:
     }
 
 
+def _read_url(request: urllib.request.Request) -> bytes:
+    with urllib.request.urlopen(request) as response:
+        return response.read()
+
+
 def _emoji_record(emoji: discord.Emoji) -> dict[str, object]:
     return {
         "id": emoji.id,
@@ -151,6 +163,7 @@ def _member_record(member: discord.Member) -> dict[str, object]:
         "display_name": member.display_name,
         "discriminator": member.discriminator,
         "avatar": member.avatar.key if member.avatar else None,
+        "avatar_url": str(member.avatar.url) if member.avatar else None,
         "bot": member.bot,
         "system": member.system,
         "nick": member.nick,

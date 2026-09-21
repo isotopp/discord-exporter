@@ -39,6 +39,10 @@ class EmptyGuildSource:
         assert after_message_id
         return []
 
+    async def download_media(self, url: str) -> bytes:
+        assert url
+        return b"media"
+
 
 class MemberGuildSource(EmptyGuildSource):
     async def fetch_members(self, guild_id: int) -> list[dict[str, object]]:
@@ -61,6 +65,23 @@ class MemberGuildSource(EmptyGuildSource):
                 "joined_at": "2021-02-03T04:05:06+00:00",
             },
         ]
+
+
+class AvatarMemberGuildSource(MemberGuildSource):
+    def __init__(self) -> None:
+        self.downloads = 0
+
+    async def fetch_members(self, guild_id: int) -> list[dict[str, object]]:
+        records = await super().fetch_members(guild_id)
+        records[0]["avatar_url"] = (
+            "https://cdn.example/avatars/avatar-alice.png?size=1024"
+        )
+        return records
+
+    async def download_media(self, url: str) -> bytes:
+        self.downloads += 1
+        assert url.endswith(".png?size=1024")
+        return b"avatar-bytes"
 
 
 class ChannelGuildSource(MemberGuildSource):
@@ -339,6 +360,29 @@ def test_exporting_members_preserves_distinct_ids_and_does_not_duplicate_on_reru
             "username": "bob",
         },
     ]
+
+
+def test_member_avatars_are_downloaded_once_and_referenced_relatively(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = AvatarMemberGuildSource()
+
+    asyncio.run(export_guild(config, source))
+    asyncio.run(export_guild(config, source))
+
+    members = [
+        json.loads(line)
+        for line in (root / "members.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert members[0]["avatar_path"] == "media/avatars/111--avatar-alice.png"
+    assert members[1]["avatar"] is None
+    assert source.downloads == 1
+    assert (
+        root / "media" / "avatars" / "111--avatar-alice.png"
+    ).read_bytes() == b"avatar-bytes"
 
 
 def test_exporting_channels_keeps_ids_stable_when_a_channel_is_renamed(

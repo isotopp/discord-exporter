@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlparse
 
 import discord
 
@@ -25,6 +26,8 @@ class GuildSource(Protocol):
     async def fetch_messages_after(
         self, channel_id: int, after_message_id: str
     ) -> Sequence[Mapping[str, object]]: ...
+
+    async def download_media(self, url: str) -> bytes: ...
 
 
 async def export_guild(config: Config, source: GuildSource) -> None:
@@ -48,10 +51,15 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     if not isinstance(channel_states, dict):
         raise TypeError("Archive state has invalid channel entries")
 
-    members = _member_records(
-        await _with_retries(
-            lambda: source.fetch_members(config.guild_id), request_policy.sleep
-        )
+    members = await _download_member_avatars(
+        _member_records(
+            await _with_retries(
+                lambda: source.fetch_members(config.guild_id), request_policy.sleep
+            )
+        ),
+        source,
+        config.export_root,
+        request_policy.sleep,
     )
     channels = _channel_records(
         await _with_retries(
@@ -142,6 +150,34 @@ def _failure_record(operation: str, object_id: str, error: object) -> dict[str, 
         "channel_id": object_id,
         "error": type(error).__name__,
     }
+
+
+async def _download_member_avatars(
+    members: Sequence[Mapping[str, object]],
+    source: GuildSource,
+    export_root: Path,
+    sleep: Callable[[float], Awaitable[None]],
+) -> list[Mapping[str, object]]:
+    avatars_root = export_root / "media" / "avatars"
+    enriched_members: list[Mapping[str, object]] = []
+    for member in members:
+        enriched = dict(member)
+        avatar_url = member.get("avatar_url")
+        if isinstance(avatar_url, str) and avatar_url:
+            member_id = str(member["id"])
+            avatar_id = str(member.get("avatar") or "avatar")
+            suffix = Path(urlparse(avatar_url).path).suffix or ".bin"
+            avatar_path = avatars_root / f"{member_id}--{avatar_id}{suffix}"
+            if not avatar_path.is_file():
+                avatar_path.write_bytes(
+                    await _with_retries(
+                        lambda avatar_url=avatar_url: source.download_media(avatar_url),
+                        sleep,
+                    )
+                )
+            enriched["avatar_path"] = avatar_path.relative_to(export_root).as_posix()
+        enriched_members.append(enriched)
+    return enriched_members
 
 
 def _manifest_channels(
