@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+import discord
 
 from .config import Config
 
@@ -26,7 +28,12 @@ class GuildSource(Protocol):
 
 
 async def export_guild(config: Config, source: GuildSource) -> None:
-    normalized_guild = _stringify_ids(await source.fetch_guild(config.guild_id))
+    request_policy = config.request_policy
+    normalized_guild = _stringify_ids(
+        await _with_retries(
+            lambda: source.fetch_guild(config.guild_id), request_policy.sleep
+        )
+    )
     if not isinstance(normalized_guild, Mapping):
         raise TypeError("Discord returned an invalid guild record")
     if normalized_guild.get("id") != str(config.guild_id):
@@ -41,36 +48,87 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     if not isinstance(channel_states, dict):
         raise TypeError("Archive state has invalid channel entries")
 
-    members = _member_records(await source.fetch_members(config.guild_id))
-    channels = _channel_records(
-        await source.fetch_channels(config.guild_id), config.export_root
+    members = _member_records(
+        await _with_retries(
+            lambda: source.fetch_members(config.guild_id), request_policy.sleep
+        )
     )
-    for channel in channels:
-        channel_id = str(channel["id"])
-        if channel.get("accessible", True) is False:
-            channel_states[channel_id] = _incomplete_channel_state()
-        else:
-            messages = _message_records(
-                await _fetch_channel_messages(source, int(channel_id)), channel_id
-            )
-            _write_message_files(
-                config.export_root / str(channel["archive_path"]), messages, channel_id
-            )
-            channel_states[channel_id] = _complete_channel_state(messages)
-        _write_state_atomic(state_path, state)
+    channels = _channel_records(
+        await _with_retries(
+            lambda: source.fetch_channels(config.guild_id), request_policy.sleep
+        ),
+        config.export_root,
+    )
+    manifest: dict[str, object] = {
+        "failures": [],
+        "format_version": 1,
+        "source_guild_id": str(config.guild_id),
+        "status": "in_progress",
+    }
+    failures = manifest["failures"]
+    if not isinstance(failures, list):
+        raise TypeError("Archive manifest has invalid failures")
 
     _write_json(config.export_root / "server.json", normalized_guild)
     _write_jsonl(config.export_root / "members.jsonl", members)
     _write_jsonl(config.export_root / "channels.jsonl", channels)
-    _write_json(
-        config.export_root / "manifest.json",
-        {
-            "format_version": 1,
-            "source_guild_id": str(config.guild_id),
-            "status": "in_progress",
-        },
-    )
+    _write_json(config.export_root / "manifest.json", manifest)
+
+    for channel in channels:
+        channel_id = str(channel["id"])
+        try:
+            if channel.get("accessible", True) is False:
+                channel_states[channel_id] = _incomplete_channel_state()
+                if channel.get("access_error"):
+                    failures.append(
+                        _failure_record("channel", channel_id, channel["access_error"])
+                    )
+            else:
+                messages = _message_records(
+                    await _fetch_channel_messages(
+                        source, int(channel_id), request_policy.sleep
+                    ),
+                    channel_id,
+                )
+                _write_message_files(
+                    config.export_root / str(channel["archive_path"]),
+                    messages,
+                    channel_id,
+                )
+                channel_states[channel_id] = _complete_channel_state(messages)
+        except (discord.DiscordException, OSError) as error:
+            failures.append(_failure_record("messages", channel_id, error))
+            channel_states[channel_id] = _incomplete_channel_state()
+        _write_state_atomic(state_path, state)
+        _write_json(config.export_root / "manifest.json", manifest)
     _write_state_atomic(state_path, state)
+
+
+async def _with_retries[T](
+    operation: Callable[[], Awaitable[T]],
+    sleep: Callable[[float], Awaitable[None]],
+    attempts: int = 3,
+) -> T:
+    for attempt in range(attempts):
+        try:
+            return await operation()
+        except discord.RateLimited as error:
+            if attempt == attempts - 1:
+                raise
+            await sleep(error.retry_after)
+        except discord.DiscordServerError:
+            if attempt == attempts - 1:
+                raise
+            await sleep(float(2**attempt))
+    raise RuntimeError("retry loop exhausted")
+
+
+def _failure_record(operation: str, object_id: str, error: object) -> dict[str, str]:
+    return {
+        "operation": operation,
+        "channel_id": object_id,
+        "error": type(error).__name__,
+    }
 
 
 def _stringify_ids(value: object, key: str | None = None) -> object:
@@ -178,13 +236,23 @@ def _message_records(
 
 
 async def _fetch_channel_messages(
-    source: GuildSource, channel_id: int
+    source: GuildSource,
+    channel_id: int,
+    sleep: Callable[[float], Awaitable[None]],
 ) -> list[Mapping[str, object]]:
-    records = list(await source.fetch_messages(channel_id))
+    records = list(
+        await _with_retries(lambda: source.fetch_messages(channel_id), sleep)
+    )
     seen_ids = {_record_id(record) for record in records}
     cursor = _latest_message_id(records) or "0"
-    while cursor:
-        newer_records = await source.fetch_messages_after(channel_id, cursor)
+    while cursor is not None:
+        current_cursor = cursor
+        newer_records = await _with_retries(
+            lambda current_cursor=current_cursor: source.fetch_messages_after(
+                channel_id, current_cursor
+            ),
+            sleep,
+        )
         fresh_records = [
             record for record in newer_records if _record_id(record) not in seen_ids
         ]

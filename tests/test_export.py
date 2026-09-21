@@ -3,6 +3,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+import discord
 import pytest
 
 from discord_exporter.archive import export_guild
@@ -221,6 +222,45 @@ class MessageWindowGuildSource(ChannelGuildSource):
         return await super().fetch_messages(channel_id)
 
 
+class RateLimitedMessageGuildSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            self.calls += 1
+            if self.calls == 1:
+                raise discord.RateLimited(0)
+            return [
+                {
+                    "id": 600,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "after rate limit",
+                }
+            ]
+        return await super().fetch_messages(channel_id)
+
+
+class FailedChannelGuildSource(ChannelGuildSource):
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            raise OSError("network unavailable")
+        if channel_id == 101:
+            return [
+                {
+                    "id": 601,
+                    "channel_id": 101,
+                    "author_id": 222,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "other channel continues",
+                }
+            ]
+        return await super().fetch_messages(channel_id)
+
+
 class InaccessibleChannelGuildSource(ChannelGuildSource):
     async def fetch_channels(self, guild_id: int) -> list[dict[str, object]]:
         records = await super().fetch_channels(guild_id)
@@ -252,6 +292,7 @@ def test_exporting_an_empty_guild_creates_the_initial_archive(tmp_path: Path) ->
         "roles": [{"id": "789", "name": "Archive"}],
     }
     assert json.loads((root / "manifest.json").read_text()) == {
+        "failures": [],
         "format_version": 1,
         "source_guild_id": "123",
         "status": "in_progress",
@@ -605,3 +646,35 @@ def test_resume_repairs_a_partial_jsonl_line_and_merges_missing_records(
         "500",
         "501",
     ]
+
+
+def test_rate_limit_is_retried_before_message_is_written(tmp_path: Path) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = RateLimitedMessageGuildSource()
+
+    asyncio.run(export_guild(config, source))
+
+    assert source.calls == 2
+    assert (root / "channels" / "general--100" / "2021" / "messages.jsonl").is_file()
+    assert (
+        json.loads((root / "state.json").read_text())["channels"]["100"]["complete"]
+        is True
+    )
+
+
+def test_permanent_channel_failure_is_recorded_without_stopping_other_channels(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    asyncio.run(export_guild(config, FailedChannelGuildSource()))
+
+    assert json.loads((root / "manifest.json").read_text())["failures"] == [
+        {"channel_id": "100", "error": "OSError", "operation": "messages"}
+    ]
+    state = json.loads((root / "state.json").read_text())["channels"]
+    assert state["100"]["complete"] is False
+    assert state["101"]["complete"] is True
+    assert (root / "channels" / "discussion--101" / "2021" / "messages.jsonl").is_file()
