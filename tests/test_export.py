@@ -25,6 +25,10 @@ class EmptyGuildSource:
         assert guild_id == 123
         return []
 
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        assert channel_id == 0
+        return []
+
 
 class MemberGuildSource(EmptyGuildSource):
     async def fetch_members(self, guild_id: int) -> list[dict[str, object]]:
@@ -76,6 +80,54 @@ class ChannelGuildSource(MemberGuildSource):
                 "accessible": True,
             },
         ]
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        assert channel_id in {100, 101}
+        return []
+
+
+class MessageGuildSource(ChannelGuildSource):
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return [
+                {
+                    "id": 200,
+                    "channel_id": 100,
+                    "author_id": 222,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "new year",
+                },
+                {
+                    "id": 201,
+                    "channel_id": 100,
+                    "author_id": 222,
+                    "created_at": "2021-01-01T00:00:01+00:00",
+                    "content": "one second later",
+                },
+                {
+                    "id": 199,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2020-12-31T23:59:00+00:00",
+                    "content": "old year",
+                },
+            ]
+        return await super().fetch_messages(channel_id)
+
+
+class OffsetMessageGuildSource(MessageGuildSource):
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return [
+                {
+                    "id": 198,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:30:00+01:00",
+                    "content": "still old UTC year",
+                }
+            ]
+        return await super().fetch_messages(channel_id)
 
 
 class InaccessibleChannelGuildSource(ChannelGuildSource):
@@ -220,3 +272,64 @@ def test_exporting_channels_records_inaccessible_locations_without_stopping(
     }
     assert (root / "channels" / "general--100" / "channel.json").is_file()
     assert (root / "channels" / "private--102" / "channel.json").is_file()
+
+
+def test_exporting_messages_uses_utc_years_and_chronological_jsonl(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    asyncio.run(export_guild(config, MessageGuildSource()))
+
+    old_year = root / "channels" / "general--100" / "2020" / "messages.jsonl"
+    new_year = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+
+    assert [json.loads(line) for line in old_year.read_text().splitlines()] == [
+        {
+            "author_id": "111",
+            "channel_id": "100",
+            "content": "old year",
+            "created_at": "2020-12-31T23:59:00+00:00",
+            "id": "199",
+        }
+    ]
+    assert [json.loads(line) for line in new_year.read_text().splitlines()] == [
+        {
+            "author_id": "222",
+            "channel_id": "100",
+            "content": "new year",
+            "created_at": "2021-01-01T00:00:00+00:00",
+            "id": "200",
+        },
+        {
+            "author_id": "222",
+            "channel_id": "100",
+            "content": "one second later",
+            "created_at": "2021-01-01T00:00:01+00:00",
+            "id": "201",
+        },
+    ]
+    assert not (root / "channels" / "general--100" / "2019").exists()
+
+
+def test_reexporting_messages_does_not_duplicate_and_uses_utc_year(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    asyncio.run(export_guild(config, OffsetMessageGuildSource()))
+    asyncio.run(export_guild(config, OffsetMessageGuildSource()))
+
+    old_year = root / "channels" / "general--100" / "2020" / "messages.jsonl"
+    assert [json.loads(line) for line in old_year.read_text().splitlines()] == [
+        {
+            "author_id": "111",
+            "channel_id": "100",
+            "content": "still old UTC year",
+            "created_at": "2021-01-01T00:30:00+01:00",
+            "id": "198",
+        }
+    ]
+    assert not (root / "channels" / "general--100" / "2021").exists()

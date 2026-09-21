@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +15,10 @@ class GuildSource(Protocol):
     async def fetch_members(self, guild_id: int) -> Sequence[Mapping[str, object]]: ...
 
     async def fetch_channels(self, guild_id: int) -> Sequence[Mapping[str, object]]: ...
+
+    async def fetch_messages(
+        self, channel_id: int
+    ) -> Sequence[Mapping[str, object]]: ...
 
 
 async def export_guild(config: Config, source: GuildSource) -> None:
@@ -31,6 +36,15 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     channels = _channel_records(
         await source.fetch_channels(config.guild_id), config.export_root
     )
+    for channel in channels:
+        if channel.get("accessible", True) is not False:
+            messages = _message_records(
+                await source.fetch_messages(int(str(channel["id"]))),
+                str(channel["id"]),
+            )
+            _write_message_files(
+                config.export_root / str(channel["archive_path"]), messages
+            )
 
     _write_json(config.export_root / "server.json", normalized_guild)
     _write_jsonl(config.export_root / "members.jsonl", members)
@@ -120,6 +134,52 @@ def _channel_path(channels_root: Path, channel_id: str, channel_name: object) ->
         or "channel"
     )
     return channels_root / f"{safe_name}--{channel_id}"
+
+
+def _message_records(
+    records: Sequence[Mapping[str, object]], channel_id: str
+) -> dict[int, list[Mapping[str, object]]]:
+    by_id: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        normalized = _stringify_ids(record)
+        if not isinstance(normalized, Mapping):
+            raise TypeError("Discord returned an invalid message record")
+        message_id = normalized.get("id")
+        if not isinstance(message_id, str):
+            raise TypeError("Discord returned a message without an ID")
+        if normalized.get("channel_id") != channel_id:
+            raise ValueError("Discord returned a message for a different channel")
+        _message_timestamp(normalized)
+        by_id[message_id] = normalized
+
+    by_year: dict[int, list[Mapping[str, object]]] = {}
+    for record in by_id.values():
+        year = _message_timestamp(record).year
+        by_year.setdefault(year, []).append(record)
+    for records_in_year in by_year.values():
+        records_in_year.sort(
+            key=lambda record: (_message_timestamp(record), str(record["id"]))
+        )
+    return by_year
+
+
+def _message_timestamp(record: Mapping[str, object]) -> datetime:
+    value = record.get("created_at")
+    if not isinstance(value, str):
+        raise TypeError("Discord returned a message without a creation timestamp")
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC)
+
+
+def _write_message_files(
+    channel_path: Path, messages: Mapping[int, Sequence[Mapping[str, object]]]
+) -> None:
+    for year, records in sorted(messages.items()):
+        year_path = channel_path / str(year)
+        year_path.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(year_path / "messages.jsonl", records)
 
 
 def _write_json(path: Path, value: object) -> None:

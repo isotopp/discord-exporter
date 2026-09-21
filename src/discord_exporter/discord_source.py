@@ -64,6 +64,20 @@ class DiscordGuildSource:
         finally:
             await client.close()
 
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        client = discord.Client(intents=discord.Intents.none())
+        try:
+            await client.login(self.token)
+            channel = await client.fetch_channel(channel_id)
+            if not isinstance(channel, discord.abc.Messageable):
+                return []
+            messages: list[dict[str, object]] = []
+            async for message in channel.history(limit=None, oldest_first=True):
+                messages.append(_message_record(message))
+            return messages
+        finally:
+            await client.close()
+
 
 def _role_record(role: discord.Role) -> dict[str, object]:
     return {
@@ -156,6 +170,17 @@ def _thread_record(thread: discord.Thread) -> dict[str, object]:
             thread.archive_timestamp.isoformat() if thread.archive_timestamp else None
         ),
         "accessible": True,
+    }
+
+
+def _message_record(message: discord.Message) -> dict[str, object]:
+    return {
+        "id": message.id,
+        "channel_id": message.channel.id,
+        "author_id": message.author.id,
+        "created_at": message.created_at.isoformat(),
+        "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+        "content": message.content,
     }
 
 
