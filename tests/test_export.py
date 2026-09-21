@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -207,6 +208,17 @@ class CatchUpMessageGuildSource(ChannelGuildSource):
                 }
             ]
         return []
+
+
+class MessageWindowGuildSource(ChannelGuildSource):
+    def __init__(self, messages: list[Mapping[str, object]]) -> None:
+        super().__init__()
+        self.messages: list[dict[str, object]] = [dict(message) for message in messages]
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id == 100:
+            return self.messages
+        return await super().fetch_messages(channel_id)
 
 
 class InaccessibleChannelGuildSource(ChannelGuildSource):
@@ -539,3 +551,57 @@ def test_state_replacement_failure_keeps_previous_state_and_durable_messages(
             json.loads(line)["id"] for line in message_path.read_text().splitlines()
         )
     assert message_ids == ["199", "200", "201"]
+
+
+def test_resume_repairs_a_partial_jsonl_line_and_merges_missing_records(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    first_message: dict[str, object] = {
+        "id": 500,
+        "channel_id": 100,
+        "author_id": 111,
+        "created_at": "2021-01-01T00:00:00+00:00",
+        "content": "already durable",
+    }
+    second_message: dict[str, object] = {
+        "id": 501,
+        "channel_id": 100,
+        "author_id": 222,
+        "created_at": "2021-01-01T00:01:00+00:00",
+        "content": "missing from the archive",
+    }
+    source = MessageWindowGuildSource([first_message])
+
+    asyncio.run(export_guild(config, source))
+
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+    message_path.write_text(
+        message_path.read_text() + '{"id":"truncated', encoding="utf-8"
+    )
+    (root / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "channels": {
+                    "100": {
+                        "last_message_id": "999",
+                        "last_message_timestamp": "2021-01-01T00:09:00+00:00",
+                        "complete": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    source.messages = [second_message]
+
+    asyncio.run(export_guild(config, source))
+
+    assert [
+        json.loads(line)["id"] for line in message_path.read_text().splitlines()
+    ] == [
+        "500",
+        "501",
+    ]

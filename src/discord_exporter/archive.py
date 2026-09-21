@@ -54,7 +54,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
                 await _fetch_channel_messages(source, int(channel_id)), channel_id
             )
             _write_message_files(
-                config.export_root / str(channel["archive_path"]), messages
+                config.export_root / str(channel["archive_path"]), messages, channel_id
             )
             channel_states[channel_id] = _complete_channel_state(messages)
         _write_state_atomic(state_path, state)
@@ -230,12 +230,45 @@ def _message_timestamp(record: Mapping[str, object]) -> datetime:
 
 
 def _write_message_files(
-    channel_path: Path, messages: Mapping[int, Sequence[Mapping[str, object]]]
+    channel_path: Path,
+    messages: Mapping[int, Sequence[Mapping[str, object]]],
+    channel_id: str,
 ) -> None:
-    for year, records in sorted(messages.items()):
+    existing_paths = sorted(channel_path.glob("*/messages.jsonl"))
+    existing_records = _read_existing_messages(existing_paths)
+    current_records = [
+        record for records_in_year in messages.values() for record in records_in_year
+    ]
+    merged_messages = _message_records(
+        [*existing_records, *current_records], channel_id
+    )
+    written_years = set(merged_messages)
+    for path in existing_paths:
+        if path.parent.name not in {str(year) for year in written_years}:
+            path.unlink()
+    for year, records in sorted(merged_messages.items()):
         year_path = channel_path / str(year)
         year_path.mkdir(parents=True, exist_ok=True)
         _write_jsonl(year_path / "messages.jsonl", records)
+
+
+def _read_existing_messages(paths: Sequence[Path]) -> list[Mapping[str, object]]:
+    records: list[Mapping[str, object]] = []
+    for path in paths:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                if index == len(lines) - 1:
+                    break
+                raise
+            if not isinstance(value, Mapping):
+                raise TypeError("Archive JSONL contains an invalid message record")
+            records.append(value)
+    return records
 
 
 def _load_state(path: Path) -> dict[str, object]:
