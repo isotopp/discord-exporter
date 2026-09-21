@@ -60,8 +60,12 @@ async def export_guild(config: Config, source: GuildSource) -> None:
         config.export_root,
     )
     manifest: dict[str, object] = {
+        "channels": _manifest_channels(channels, channel_states),
+        "export_finished_at": None,
+        "export_started_at": datetime.now(UTC).isoformat(),
         "failures": [],
         "format_version": 1,
+        "incomplete_channels": _incomplete_channel_ids(channels, channel_states),
         "source_guild_id": str(config.guild_id),
         "status": "in_progress",
     }
@@ -99,8 +103,17 @@ async def export_guild(config: Config, source: GuildSource) -> None:
         except (discord.DiscordException, OSError) as error:
             failures.append(_failure_record("messages", channel_id, error))
             channel_states[channel_id] = _incomplete_channel_state()
+        manifest["channels"] = _manifest_channels(channels, channel_states)
+        manifest["incomplete_channels"] = _incomplete_channel_ids(
+            channels, channel_states
+        )
         _write_state_atomic(state_path, state)
         _write_json(config.export_root / "manifest.json", manifest)
+    incomplete_channels = _incomplete_channel_ids(channels, channel_states)
+    manifest["incomplete_channels"] = incomplete_channels
+    manifest["export_finished_at"] = datetime.now(UTC).isoformat()
+    manifest["status"] = "complete" if not incomplete_channels else "incomplete"
+    _write_json(config.export_root / "manifest.json", manifest)
     _write_state_atomic(state_path, state)
 
 
@@ -129,6 +142,37 @@ def _failure_record(operation: str, object_id: str, error: object) -> dict[str, 
         "channel_id": object_id,
         "error": type(error).__name__,
     }
+
+
+def _manifest_channels(
+    channels: Sequence[Mapping[str, object]],
+    channel_states: Mapping[str, object],
+) -> list[dict[str, object]]:
+    summaries: list[dict[str, object]] = []
+    for channel in channels:
+        channel_id = str(channel["id"])
+        state = channel_states.get(channel_id)
+        complete = isinstance(state, Mapping) and state.get("complete") is True
+        summaries.append(
+            {
+                "archive_path": str(channel["archive_path"]),
+                "complete": complete,
+                "id": channel_id,
+            }
+        )
+    return summaries
+
+
+def _incomplete_channel_ids(
+    channels: Sequence[Mapping[str, object]],
+    channel_states: Mapping[str, object],
+) -> list[str]:
+    incomplete: list[str] = []
+    for channel in channels:
+        state = channel_states.get(str(channel["id"]))
+        if not isinstance(state, Mapping) or state.get("complete") is not True:
+            incomplete.append(str(channel["id"]))
+    return incomplete
 
 
 def _stringify_ids(value: object, key: str | None = None) -> object:

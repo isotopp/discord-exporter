@@ -291,12 +291,14 @@ def test_exporting_an_empty_guild_creates_the_initial_archive(tmp_path: Path) ->
         "owner_id": "456",
         "roles": [{"id": "789", "name": "Archive"}],
     }
-    assert json.loads((root / "manifest.json").read_text()) == {
-        "failures": [],
-        "format_version": 1,
-        "source_guild_id": "123",
-        "status": "in_progress",
-    }
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["failures"] == []
+    assert manifest["format_version"] == 1
+    assert manifest["source_guild_id"] == "123"
+    assert manifest["status"] == "complete"
+    assert manifest["incomplete_channels"] == []
+    assert isinstance(manifest["export_started_at"], str)
+    assert isinstance(manifest["export_finished_at"], str)
     assert json.loads((root / "state.json").read_text()) == {
         "version": 1,
         "channels": {},
@@ -678,3 +680,39 @@ def test_permanent_channel_failure_is_recorded_without_stopping_other_channels(
     assert state["100"]["complete"] is False
     assert state["101"]["complete"] is True
     assert (root / "channels" / "discussion--101" / "2021" / "messages.jsonl").is_file()
+
+
+def test_completed_manifest_keeps_archive_paths_portable_after_relocation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+
+    asyncio.run(export_guild(config, MessageGuildSource()))
+    relocated = tmp_path / "relocated"
+    root.rename(relocated)
+
+    manifest = json.loads((relocated / "manifest.json").read_text())
+
+    assert manifest["status"] == "complete"
+    assert manifest["incomplete_channels"] == []
+    assert manifest["failures"] == []
+    assert manifest["channels"] == [
+        {
+            "archive_path": "channels/general--100",
+            "complete": True,
+            "id": "100",
+        },
+        {
+            "archive_path": "channels/discussion--101",
+            "complete": True,
+            "id": "101",
+        },
+    ]
+    assert all(
+        not Path(channel["archive_path"]).is_absolute()
+        for channel in manifest["channels"]
+    )
+    assert (
+        relocated / manifest["channels"][0]["archive_path"] / "channel.json"
+    ).is_file()
