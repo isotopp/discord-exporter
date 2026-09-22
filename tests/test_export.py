@@ -1153,11 +1153,24 @@ def test_exporting_messages_reports_replaceable_tty_channel_progress(
     asyncio.run(export_guild(config, MessageGuildSource(), progress))
 
     output = progress.getvalue()
-    assert output.count("\n") == 2
-    assert output.count("\r\033[2K") == 4
-    assert "\r\033[2KChannel 1/2 (50%): general [100] — exporting" in output
-    assert "\r\033[2KChannel 1/2 (50%): general [100] — complete\n" in output
-    assert "\r\033[2KChannel 2/2 (100%): discussion [101] — complete\n" in output
+    assert output.count("\n") == 4
+    assert output.count("\r\033[2K") == 9
+    assert (
+        "\r\033[2KChannel 1/2 (50%): general [100] — starting full history; 0 new messages"
+        in output
+    )
+    assert (
+        "\r\033[2KChannel 1/2 (50%): general [100] — exporting; 3 new messages"
+        in output
+    )
+    assert (
+        "\r\033[2KChannel 1/2 (50%): general [100] — complete; 3 new messages\n"
+        in output
+    )
+    assert (
+        "\r\033[2KChannel 2/2 (100%): discussion [101] — complete; 0 new messages\n"
+        in output
+    )
 
 
 def test_exporting_messages_reports_plain_progress_without_terminal_controls(
@@ -1172,8 +1185,47 @@ def test_exporting_messages_reports_plain_progress_without_terminal_controls(
     output = progress.getvalue()
     assert "\r" not in output
     assert "\033" not in output
-    assert "Channel 1/2 (50%): general [100] — complete\n" in output
-    assert "Channel 2/2 (100%): discussion [101] — complete\n" in output
+    assert "Channel 1/2 (50%): general [100] — exporting; 3 new messages\n" in output
+    assert "Channel 1/2 (50%): general [100] — complete; 3 new messages\n" in output
+    assert "Channel 2/2 (100%): discussion [101] — complete; 0 new messages\n" in output
+
+
+def test_progress_explains_archive_resume_and_durable_message_counts(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = MessageWindowGuildSource(
+        [
+            {
+                "id": 500,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:00:00+00:00",
+                "content": "one message",
+            }
+        ]
+    )
+    first_progress = ProgressStream(tty=False)
+    asyncio.run(export_guild(config, source, first_progress))
+
+    first_output = first_progress.getvalue()
+    assert "Starting new archive at " in first_output
+    assert "Checkpoint summary: 0 complete, 0 partial, 2 missing" in first_output
+    assert "starting full history; 0 new messages" in first_output
+    assert "exporting; 1 new messages" in first_output
+    assert "complete; 1 new messages" in first_output
+
+    second_progress = ProgressStream(tty=False)
+    asyncio.run(export_guild(config, source, second_progress))
+
+    second_output = second_progress.getvalue()
+    assert "Existing archive detected at " in second_output
+    assert "Checkpoint summary: 2 complete, 0 partial, 0 missing" in second_output
+    assert "checking after 500 at 2021-01-01T00:00:00+00:00; 0 new messages" in (
+        second_output
+    )
+    assert "complete; 0 new messages" in second_output
 
 
 def test_state_replacement_failure_keeps_previous_state_and_durable_messages(

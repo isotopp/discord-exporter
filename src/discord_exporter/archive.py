@@ -48,6 +48,16 @@ class _Progress:
         self.total = total
         self.interactive = stream.isatty()
 
+    def set_total(self, total: int) -> None:
+        self.total = total
+
+    def phase(self, message: str) -> None:
+        if self.interactive:
+            self.stream.write(f"\r\033[2K{message}\n")
+        else:
+            self.stream.write(f"{message}\n")
+        self.stream.flush()
+
     def update(self, position: int, channel: Mapping[str, object], status: str) -> None:
         line = _progress_line(position, self.total, channel, status)
         if self.interactive:
@@ -86,6 +96,22 @@ def _display_channel_name(value: object) -> str:
 async def export_guild(
     config: Config, source: GuildSource, progress_stream: TextIO | None = None
 ) -> None:
+    progress = _Progress(
+        sys.stderr if progress_stream is None else progress_stream,
+        0,
+    )
+    state_path = config.export_root / "state.json"
+    if state_path.is_file():
+        progress.phase(
+            f"Existing archive detected at {config.export_root}; loading state.json"
+        )
+    elif config.export_root.exists():
+        progress.phase(
+            f"Archive directory found at {config.export_root}; no state.json checkpoint"
+        )
+    else:
+        progress.phase(f"Starting new archive at {config.export_root}")
+
     request_policy = config.request_policy
     normalized_guild = _stringify_ids(
         await _with_retries(
@@ -100,7 +126,6 @@ async def export_guild(
     config.export_root.mkdir(parents=True, exist_ok=True)
     (config.export_root / "channels").mkdir(exist_ok=True)
     (config.export_root / "media" / "avatars").mkdir(parents=True, exist_ok=True)
-    state_path = config.export_root / "state.json"
     state = _load_state(state_path)
     channel_states = state["channels"]
     if not isinstance(channel_states, dict):
@@ -137,8 +162,10 @@ async def export_guild(
     failures = manifest["failures"]
     if not isinstance(failures, list):
         raise TypeError("Archive manifest has invalid failures")
-    progress = _Progress(
-        sys.stderr if progress_stream is None else progress_stream, len(channels)
+    progress.set_total(len(channels))
+    complete, partial, missing = _checkpoint_summary(channels, channel_states)
+    progress.phase(
+        f"Checkpoint summary: {complete} complete, {partial} partial, {missing} missing"
     )
 
     _write_json(config.export_root / "server.json", normalized_guild)
@@ -148,9 +175,12 @@ async def export_guild(
 
     for position, channel in enumerate(channels, 1):
         channel_id = str(channel["id"])
-        progress.update(position, channel, "exporting")
+        new_count = 0
         try:
             if channel.get("accessible", True) is False:
+                progress.update(
+                    position, channel, "starting full history; 0 new messages"
+                )
                 channel_states[channel_id] = _incomplete_channel_state()
                 if channel.get("access_error"):
                     failures.append(
@@ -162,9 +192,10 @@ async def export_guild(
                 existing_records = _read_existing_messages(
                     sorted(channel_path.glob("*/messages.jsonl"))
                 )
-                resume_cursor = _resume_cursor(
+                resume_cursor, resume_status = _resume_decision(
                     existing_records, channel_states.get(channel_id)
                 )
+                progress.update(position, channel, f"{resume_status}; 0 new messages")
                 existing_ids = {_record_id(record) for record in existing_records}
                 archived_records = list(existing_records)
                 async for raw_message in _iter_channel_messages(
@@ -206,9 +237,17 @@ async def export_guild(
                                 enriched_record, complete=False
                             )
                             _write_state_atomic(state_path, state)
+                            new_count += 1
+                            progress.update(
+                                position,
+                                channel,
+                                f"exporting; {new_count} new messages",
+                            )
                 archived_messages = _message_records(archived_records, channel_id)
                 channel_states[channel_id] = _complete_channel_state(archived_messages)
-                progress.finish(position, channel, "complete")
+                progress.finish(
+                    position, channel, f"complete; {new_count} new messages"
+                )
         except (discord.DiscordException, OSError, TypeError, ValueError) as error:
             failure = _failure_record("messages", channel_id, error)
             if isinstance(error, ArchiveFormatError):
@@ -217,7 +256,7 @@ async def export_guild(
             channel_states[channel_id] = _incomplete_channel_state(
                 channel_states.get(channel_id)
             )
-            progress.finish(position, channel, "failed")
+            progress.finish(position, channel, f"failed; {new_count} new messages")
         except KeyboardInterrupt:
             progress.abort()
             raise
@@ -661,6 +700,12 @@ async def _iter_channel_messages(
 def _resume_cursor(
     existing_records: Sequence[Mapping[str, object]], channel_state: object
 ) -> str | None:
+    return _resume_decision(existing_records, channel_state)[0]
+
+
+def _resume_decision(
+    existing_records: Sequence[Mapping[str, object]], channel_state: object
+) -> tuple[str | None, str]:
     last_message_id = (
         channel_state.get("last_message_id")
         if isinstance(channel_state, Mapping)
@@ -668,12 +713,30 @@ def _resume_cursor(
     )
     existing_ids = {_record_id(record) for record in existing_records}
     if last_message_id is not None and last_message_id not in existing_ids:
-        return None
+        return (
+            None,
+            f"starting full history; checkpoint {last_message_id} is absent from JSONL",
+        )
     if existing_records:
-        return _latest_message_id(existing_records)
+        latest = _latest_message_record(existing_records)
+        latest_id = _record_id(latest)
+        latest_timestamp = latest.get("created_at")
+        if not isinstance(latest_timestamp, str):
+            raise TypeError("Archive message has an invalid creation timestamp")
+        if isinstance(channel_state, Mapping) and channel_state.get("complete") is True:
+            return latest_id, f"checking after {latest_id} at {latest_timestamp}"
+        if last_message_id is not None and last_message_id != latest_id:
+            return (
+                latest_id,
+                (
+                    f"resuming after {latest_id} at {latest_timestamp}; "
+                    f"JSONL is ahead of checkpoint {last_message_id}"
+                ),
+            )
+        return latest_id, f"resuming after {latest_id} at {latest_timestamp}"
     if isinstance(channel_state, Mapping) and channel_state.get("complete") is True:
-        return "0"
-    return None
+        return "0", "checking empty archive"
+    return None, "starting full history"
 
 
 def _record_id(record: Mapping[str, object]) -> str:
@@ -686,6 +749,12 @@ def _record_id(record: Mapping[str, object]) -> str:
 def _latest_message_id(records: Sequence[Mapping[str, object]]) -> str | None:
     if not records:
         return None
+    return _record_id(_latest_message_record(records))
+
+
+def _latest_message_record(
+    records: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
     normalized: list[Mapping[str, object]] = []
     for record in records:
         value = _stringify_ids(record)
@@ -696,7 +765,7 @@ def _latest_message_id(records: Sequence[Mapping[str, object]]) -> str | None:
         normalized,
         key=lambda record: (_message_timestamp(record), _record_id(record)),
     )
-    return _record_id(latest)
+    return latest
 
 
 def _message_timestamp(record: Mapping[str, object]) -> datetime:
@@ -775,6 +844,21 @@ def _incomplete_channel_state(previous: object = None) -> dict[str, object]:
             "complete": False,
         }
     return _message_channel_state(None, complete=False)
+
+
+def _checkpoint_summary(
+    channels: Sequence[Mapping[str, object]], channel_states: Mapping[str, object]
+) -> tuple[int, int, int]:
+    complete = partial = missing = 0
+    for channel in channels:
+        state = channel_states.get(str(channel["id"]))
+        if not isinstance(state, Mapping):
+            missing += 1
+        elif state.get("complete") is True:
+            complete += 1
+        else:
+            partial += 1
+    return complete, partial, missing
 
 
 def _message_channel_state(
