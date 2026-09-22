@@ -31,7 +31,7 @@ load and the configured pacing delay.
 - An interrupted channel resumes from the newest message proven durable by the
   archive, when such a cursor exists.
 - Missing or inconsistent archive data takes precedence over optimistic state;
-  the exporter repairs or refetches rather than silently skipping messages.
+  the exporter reports or refetches rather than silently skipping messages.
 
 ### Actual behavior
 
@@ -42,6 +42,10 @@ load and the configured pacing delay.
 - The saved `last_message_id` is never supplied to the message-fetch path.
 - Existing JSONL is merged by source message ID and existing media is reused,
   so reruns avoid duplicate output but not duplicate Discord requests.
+- Existing yearly JSONL is rewritten rather than extended by appending only
+  newer complete records.
+- A malformed final JSONL line is currently ignored without asking the
+  operator to repair the archive.
 
 ## Evidence
 
@@ -56,7 +60,10 @@ load and the configured pacing delay.
   `last_message_timestamp`, and `complete`, but those values are not consumed
   by the fetch path.
 - `src/discord_exporter/archive.py:572-592` merges existing and current records,
-  which explains why output remains deduplicated despite the repeated fetch.
+  then rewrites each yearly JSONL, which explains why output remains
+  deduplicated despite the repeated fetch.
+- `src/discord_exporter/archive.py:595-607` stops reading when the final JSONL
+  line is malformed instead of reporting the damaged file to the operator.
 - The original acceptance criterion in
   `developer/2026-09-21-restartable-discord-export/user-stories.md:135-153`
   explicitly requires resume without starting over or skipping messages.
@@ -79,6 +86,8 @@ not repeat completed history or skip messages.
   the full-history boundary is not called for that channel.
 - Messages newer than the cursor are exported in chronological order, with the
   existing media, deduplication, and catch-up behavior preserved.
+- New messages are appended to their yearly JSONL as complete newline-terminated
+  records; existing valid records are not rewritten.
 - A completed channel with no newer messages remains complete and does not
   rewrite unchanged yearly JSONL files.
 - If state claims progress that the archive cannot prove, the exporter falls
@@ -86,6 +95,9 @@ not repeat completed history or skip messages.
 - If durable JSONL is ahead of state because execution stopped before atomic
   state replacement, resume uses the archive evidence and does not duplicate
   records.
+- A malformed or partial JSONL line is not used as cursor evidence or repaired
+  automatically. The exporter identifies the affected file and leaves the
+  channel incomplete for operator repair.
 - State advances only after new message records and media outcomes are durable.
 - One channel's invalid checkpoint or request failure does not prevent other
   channels from resuming.
@@ -136,6 +148,7 @@ prints only after `export_guild()` returns, and the channel loop in
 - Reconcile global channel state with durable per-channel JSONL.
 - Select full-history or incremental fetching independently per channel.
 - Resume completed and interrupted channels from proven durable cursors.
+- Append new complete records without rewriting existing message history.
 - Preserve atomic state replacement and existing failure isolation.
 - Report single-line live progress and retain one final line per processed
   channel.
@@ -147,6 +160,7 @@ prints only after `export_guild()` returns, and the channel loop in
 - Detecting edits or deletions to messages at or before a durable cursor.
 - Parallel channel export.
 - Changing yearly archive sharding or media layout.
+- Automatically repairing or discarding malformed JSONL content.
 - Interactive controls, a graphical interface, and message- or byte-level
   completion percentages.
 
