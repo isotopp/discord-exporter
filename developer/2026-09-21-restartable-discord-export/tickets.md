@@ -210,8 +210,8 @@ Observable behavior:
 
 - Each exporter-controlled HTTPS request is separated by a random delay within
   the configured minimum and maximum.
-- The configured Firefox user agent is sent with the requested Firefox
-  content-encoding and language headers at supported HTTP boundaries.
+- The configured Firefox user agent is sent with gzip/deflate content-encoding
+  and language headers at supported HTTP boundaries.
 - Invalid delay ranges or a missing user agent fail configuration validation.
 - Tests observe request timing and headers through the external boundary with
   controlled time and randomness.

@@ -22,7 +22,7 @@ def test_request_policy_delays_within_configured_bounds_and_exposes_headers() ->
     assert delay == 2.5
     assert observed_delays == [2.5]
     assert policy.headers == {
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "en-US,en;q=0.5",
         "User-Agent": "Firefox/test",
     }

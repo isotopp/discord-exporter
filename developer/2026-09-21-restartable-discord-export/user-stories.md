@@ -169,7 +169,9 @@ Acceptance criteria:
   credentials unnecessarily.
 - The export is handled at a configurable, moderated pace, with a randomly jittered delay between each HTTPS request.
 - The access happens with a browser user-agent, simulating a Firefox current user-agent. I can provide one, if requested.
-- The access happens with firefox content-encoding/compression/language options as to not upset any bot detection.
+- The access requests only gzip or deflate response compression, which the
+  Python client can decode without an optional Brotli dependency, and sends
+  Firefox-like language headers.
 
 ### 7. Produce a verifiable migration handoff
 

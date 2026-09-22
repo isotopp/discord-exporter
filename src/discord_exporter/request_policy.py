@@ -38,6 +38,6 @@ class RequestPolicy:
     def headers(self) -> dict[str, str]:
         return {
             "User-Agent": self.user_agent,
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "en-US,en;q=0.5",
         }
