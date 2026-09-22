@@ -716,16 +716,17 @@ def _write_message_files(
 def _read_existing_messages(paths: Sequence[Path]) -> list[Mapping[str, object]]:
     records: list[Mapping[str, object]] = []
     for path in paths:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for index, line in enumerate(lines):
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        for index, raw_line in enumerate(lines):
+            line = raw_line.strip()
             if not line.strip():
                 continue
+            if index == len(lines) - 1 and not raw_line.endswith(("\n", "\r")):
+                raise ArchiveFormatError(path, index + 1)
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
-                if index == len(lines) - 1:
-                    break
-                raise
+                raise ArchiveFormatError(path, index + 1) from None
             if not isinstance(value, Mapping):
                 raise TypeError("Archive JSONL contains an invalid message record")
             records.append(value)
