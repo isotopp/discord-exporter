@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
 import discord
@@ -27,5 +28,7 @@ def main() -> int:
         print(f"Discord export failed: {error}", file=sys.stderr)
         return 1
 
-    print(f"Export initialized at {config.export_root}")
+    manifest = json.loads((config.export_root / "manifest.json").read_text())
+    status = "completed" if manifest.get("status") == "complete" else "incomplete"
+    print(f"Export {status} at {config.export_root}")
     return 0

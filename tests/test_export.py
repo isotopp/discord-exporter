@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -8,6 +9,15 @@ import pytest
 
 from discord_exporter.archive import export_guild
 from discord_exporter.config import Config
+
+
+class ProgressStream(io.StringIO):
+    def __init__(self, tty: bool) -> None:
+        super().__init__()
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        return self.tty
 
 
 class EmptyGuildSource:
@@ -844,6 +854,39 @@ def test_exporting_messages_records_global_channel_progress(
         },
         "version": 1,
     }
+
+
+def test_exporting_messages_reports_replaceable_tty_channel_progress(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    progress = ProgressStream(tty=True)
+
+    asyncio.run(export_guild(config, MessageGuildSource(), progress))
+
+    output = progress.getvalue()
+    assert output.count("\n") == 2
+    assert output.count("\r\033[2K") == 4
+    assert "\r\033[2KChannel 1/2 (50%): general [100] — exporting" in output
+    assert "\r\033[2KChannel 1/2 (50%): general [100] — complete\n" in output
+    assert "\r\033[2KChannel 2/2 (100%): discussion [101] — complete\n" in output
+
+
+def test_exporting_messages_reports_plain_progress_without_terminal_controls(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    progress = ProgressStream(tty=False)
+
+    asyncio.run(export_guild(config, MessageGuildSource(), progress))
+
+    output = progress.getvalue()
+    assert "\r" not in output
+    assert "\033" not in output
+    assert "Channel 1/2 (50%): general [100] — complete\n" in output
+    assert "Channel 2/2 (100%): discussion [101] — complete\n" in output
 
 
 def test_state_replacement_failure_keeps_previous_state_and_durable_messages(
