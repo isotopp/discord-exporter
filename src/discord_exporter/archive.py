@@ -21,14 +21,6 @@ class GuildSource(Protocol):
 
     async def fetch_channels(self, guild_id: int) -> Sequence[Mapping[str, object]]: ...
 
-    async def fetch_messages(
-        self, channel_id: int
-    ) -> Sequence[Mapping[str, object]]: ...
-
-    async def fetch_messages_after(
-        self, channel_id: int, after_message_id: str
-    ) -> Sequence[Mapping[str, object]]: ...
-
     def iter_messages(
         self, channel_id: int, after_message_id: str | None
     ) -> AsyncIterator[Mapping[str, object]]: ...
@@ -725,12 +717,6 @@ async def _iter_channel_messages(
             await sleep(float(2 ** (attempt - 1)))
 
 
-def _resume_cursor(
-    existing_records: Sequence[Mapping[str, object]], channel_state: object
-) -> str | None:
-    return _resume_decision(existing_records, channel_state)[0]
-
-
 def _resume_decision(
     existing_records: Sequence[Mapping[str, object]], channel_state: object
 ) -> tuple[str | None, str]:
@@ -774,12 +760,6 @@ def _record_id(record: Mapping[str, object]) -> str:
     return normalized["id"]
 
 
-def _latest_message_id(records: Sequence[Mapping[str, object]]) -> str | None:
-    if not records:
-        return None
-    return _record_id(_latest_message_record(records))
-
-
 def _latest_message_record(
     records: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
@@ -804,33 +784,6 @@ def _message_timestamp(record: Mapping[str, object]) -> datetime:
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
     return timestamp.astimezone(UTC)
-
-
-def _write_message_files(
-    channel_path: Path,
-    messages: Mapping[int, Sequence[Mapping[str, object]]],
-    channel_id: str,
-) -> dict[int, list[Mapping[str, object]]]:
-    existing_paths = sorted(channel_path.glob("*/messages.jsonl"))
-    existing_records = _read_existing_messages(existing_paths)
-    current_records = [
-        record for records_in_year in messages.values() for record in records_in_year
-    ]
-    existing_ids = {_record_id(record) for record in existing_records}
-    new_records = []
-    for record in current_records:
-        if _record_id(record) not in existing_ids:
-            existing_ids.add(_record_id(record))
-            new_records.append(record)
-    new_messages = _message_records(new_records, channel_id)
-    for year, records in sorted(new_messages.items()):
-        year_path = channel_path / str(year)
-        year_path.mkdir(parents=True, exist_ok=True)
-        _append_jsonl(year_path / "messages.jsonl", records)
-    merged_messages = _message_records(
-        [*existing_records, *current_records], channel_id
-    )
-    return merged_messages
 
 
 def _read_existing_messages(paths: Sequence[Path]) -> list[Mapping[str, object]]:
