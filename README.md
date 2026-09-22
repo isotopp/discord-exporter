@@ -53,6 +53,27 @@ These steps are for the Discord server operator. You need permission to manage t
 
 8. Check `<DISCORD_EXPORT_ROOT>/manifest.json`. `"status": "complete"` means every accessible channel finished. `"status": "incomplete"` means one or more channels could not be read; inspect `incomplete_channels` and `failures`, correct the App's access if needed, and run the command again.
 
+Quoted and unquoted `.env` values are accepted. Quotes are useful for values containing spaces but are not required for the token, IDs, paths, or numeric settings. Delay values may be fractional, for example `0.05`.
+
+## Resume and progress behavior
+
+The exporter is deliberately single-threaded and resumes automatically; there is no separate resume command or flag. Stop it with `Ctrl-C` and run `uv run discord-exporter` again using the same `DISCORD_EXPORT_ROOT`.
+
+At startup it reports whether an archive and `state.json` were found. It then reports server metadata, members and avatars, channel/thread discovery, metadata snapshot writing, and the checkpoint summary. The live channel line includes the channel name and ID, its position among all ordinary channels and threads, the resume decision, and the number of newly durable messages. A completed channel prints a final line before the next channel begins.
+
+For each message, the durable order is:
+
+1. Fetch one message.
+2. Download or reuse every referenced attachment and embed image. A permanent media failure is recorded in the message and `manifest.json`; avatars are handled during the member phase. Stickers remain metadata-only.
+3. Append one complete, newline-terminated JSON object to that channel's yearly `messages.jsonl`.
+4. Atomically replace the global `state.json` with that channel's latest message ID and timestamp and `complete: false`.
+
+The channel is marked complete only after its history stream reports no newer message. A message count is shown only after both the JSONL append and checkpoint replacement succeed. Existing JSONL ahead of the checkpoint is treated as durable, so an interrupted write is not replayed. If the checkpoint ID is absent from otherwise valid JSONL, the exporter deliberately starts that channel from full history and deduplicates existing IDs.
+
+If a JSONL file contains invalid JSON or a final unterminated line, the exporter leaves it untouched, records an incomplete channel and an `ArchiveFormatError` in `manifest.json`, and continues with other channels. Repair or remove only the damaged line/file after reviewing the archive, then rerun the same command. Never edit a JSONL file while the exporter is running.
+
+Threads are exported as channels because they have their own message history and checkpoint. The denominator and progress position include both ordinary channels and discovered active or archived threads.
+
 ## Export format and directory layout
 
 All IDs are strings so they retain Discord's full numeric precision. JSON files are pretty-printed objects; `.jsonl` files contain one JSON object per line. Times are ISO 8601 timestamps in UTC when supplied by Discord.
@@ -77,4 +98,4 @@ All IDs are strings so they retain Discord's full numeric precision. JSON files 
                 └── <message-id>--embed-<hash>.<ext>
 ```
 
-`members.jsonl` includes the member's `avatar_path` when its avatar download succeeded. Message attachments and embed images include `local_path` when downloaded; failures stay in the metadata as `download_error` and are also summarized in `manifest.json`. Stickers and other Discord objects are preserved as metadata unless the layout shows a downloaded file. Channel directory names are safe display names paired with the immutable channel ID, so links remain stable if a channel is renamed.
+`members.jsonl`, `channels.jsonl`, `server.json`, each per-channel `channel.json`, and `manifest.json` are metadata snapshots refreshed on each run. `members.jsonl` includes the member's `avatar_path` when its avatar download succeeded. Message history is different: each yearly `messages.jsonl` is append-only, with one complete record per line. Message attachments and embed images include `local_path` when downloaded and are stored in that year's adjacent `media/` directory; failures stay in the message as `download_error` and are also summarized in `manifest.json`. Stickers and other Discord objects are preserved as metadata unless the layout shows a downloaded file. Channel directory names are safe display names paired with the immutable channel ID, so links remain stable if a channel is renamed.
