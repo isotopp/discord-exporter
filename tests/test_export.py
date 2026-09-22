@@ -1413,6 +1413,32 @@ def test_malformed_jsonl_is_reported_without_touching_the_channel(
     ]
 
 
+def test_resume_accepts_unicode_line_separator_inside_message(tmp_path: Path) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = MessageWindowGuildSource(
+        [
+            {
+                "id": 500,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:00:00+00:00",
+                "content": "first paragraph\u2028second paragraph",
+            }
+        ]
+    )
+
+    asyncio.run(export_guild(config, source))
+    asyncio.run(export_guild(config, source))
+
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["failures"] == []
+    assert (
+        json.loads((root / "state.json").read_text())["channels"]["100"]["complete"]
+        is True
+    )
+
+
 def test_resume_uses_newest_valid_archive_message_when_state_is_behind(
     tmp_path: Path,
 ) -> None:

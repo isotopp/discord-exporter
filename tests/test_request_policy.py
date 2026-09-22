@@ -1,4 +1,6 @@
 import asyncio
+import io
+import urllib.request
 from types import SimpleNamespace
 from typing import Any
 
@@ -56,3 +58,25 @@ def test_discord_api_requests_keep_discord_py_headers(
 
     assert client.http.user_agent == "DiscordBot/test"
     assert client.http._HTTPClient__session.headers == {"User-Agent": "DiscordBot/test"}
+
+
+def test_media_download_has_a_socket_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_timeout: list[float | None] = []
+
+    def open_url(request: urllib.request.Request, timeout: float | None = None):
+        seen_timeout.append(timeout)
+        return io.BytesIO(b"media")
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_url)
+    policy = RequestPolicy(0, 0, "test-agent")
+
+    result = asyncio.run(
+        DiscordGuildSource("test-token", policy).download_media(
+            "https://cdn.example/media"
+        )
+    )
+
+    assert result == b"media"
+    assert seen_timeout == [30]

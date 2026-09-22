@@ -828,7 +828,8 @@ def _message_timestamp(record: Mapping[str, object]) -> datetime:
 def _read_existing_messages(paths: Sequence[Path]) -> list[Mapping[str, object]]:
     records: list[Mapping[str, object]] = []
     for path in paths:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        with path.open(encoding="utf-8", newline="") as file:
+            lines = file.readlines()
         for index, raw_line in enumerate(lines):
             line = raw_line.strip()
             if not line.strip():

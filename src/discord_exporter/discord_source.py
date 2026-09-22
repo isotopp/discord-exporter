@@ -125,7 +125,7 @@ def _role_record(role: discord.Role) -> dict[str, object]:
 
 
 def _read_url(request: urllib.request.Request) -> bytes:
-    with urllib.request.urlopen(request) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
 
 
