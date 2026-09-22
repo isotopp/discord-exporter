@@ -298,6 +298,39 @@ class InterruptingMediaSource(ChannelGuildSource):
         return b"retry bytes"
 
 
+class ErrorAfterFirstMessageSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_after_first = True
+        self.cursors: list[tuple[int, str | None]] = []
+
+    async def iter_messages(
+        self, channel_id: int, after_message_id: str | None
+    ) -> AsyncIterator[dict[str, object]]:
+        self.cursors.append((channel_id, after_message_id))
+        if channel_id != 100:
+            return
+        if after_message_id is None:
+            yield {
+                "id": 730,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:00:00+00:00",
+                "content": "first",
+            }
+            if self.fail_after_first:
+                raise OSError("stream interrupted")
+            return
+        if after_message_id == "730":
+            yield {
+                "id": 731,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:01:00+00:00",
+                "content": "second",
+            }
+
+
 class MessageMediaGuildSource(ChannelGuildSource):
     def __init__(self) -> None:
         super().__init__()
@@ -776,6 +809,38 @@ def test_interrupted_media_is_retried_before_message_checkpoint(
         "complete": True,
         "last_message_id": "720",
         "last_message_timestamp": "2021-01-01T00:00:00+00:00",
+    }
+
+
+def test_channel_error_preserves_cursor_for_the_next_run(tmp_path: Path) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = ErrorAfterFirstMessageSource()
+
+    asyncio.run(export_guild(config, source))
+
+    state = json.loads((root / "state.json").read_text())["channels"]["100"]
+    assert state == {
+        "complete": False,
+        "last_message_id": "730",
+        "last_message_timestamp": "2021-01-01T00:00:00+00:00",
+    }
+
+    source.fail_after_first = False
+    asyncio.run(export_guild(config, source))
+
+    assert [cursor for channel_id, cursor in source.cursors if channel_id == 100] == [
+        None,
+        "730",
+    ]
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+    assert [
+        json.loads(line)["id"] for line in message_path.read_text().splitlines()
+    ] == ["730", "731"]
+    assert json.loads((root / "state.json").read_text())["channels"]["100"] == {
+        "complete": True,
+        "last_message_id": "731",
+        "last_message_timestamp": "2021-01-01T00:01:00+00:00",
     }
 
 
