@@ -241,6 +241,63 @@ class InterruptingStreamGuildSource(ChannelGuildSource):
                 raise KeyboardInterrupt
 
 
+class FailedMediaThenInterruptSource(ChannelGuildSource):
+    async def iter_messages(
+        self, channel_id: int, after_message_id: str | None
+    ) -> AsyncIterator[dict[str, object]]:
+        if channel_id != 100:
+            return
+        yield {
+            "id": 710,
+            "channel_id": 100,
+            "author_id": 111,
+            "created_at": "2021-01-01T00:00:00+00:00",
+            "content": "failed file",
+            "attachments": [
+                {
+                    "id": 711,
+                    "filename": "bad.txt",
+                    "url": "https://cdn.example/bad",
+                }
+            ],
+        }
+        raise KeyboardInterrupt
+
+    async def download_media(self, url: str) -> bytes:
+        raise OSError("media unavailable")
+
+
+class InterruptingMediaSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupt_media = True
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        if channel_id != 100:
+            return await super().fetch_messages(channel_id)
+        return [
+            {
+                "id": 720,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:00:00+00:00",
+                "content": "retry file",
+                "attachments": [
+                    {
+                        "id": 721,
+                        "filename": "retry.txt",
+                        "url": "https://cdn.example/retry",
+                    }
+                ],
+            }
+        ]
+
+    async def download_media(self, url: str) -> bytes:
+        if self.interrupt_media:
+            raise KeyboardInterrupt
+        return b"retry bytes"
+
+
 class MessageMediaGuildSource(ChannelGuildSource):
     def __init__(self) -> None:
         super().__init__()
@@ -663,6 +720,62 @@ def test_interrupted_stream_leaves_a_durable_message_checkpoint(
         "complete": True,
         "last_message_id": "701",
         "last_message_timestamp": "2021-01-01T00:01:00+00:00",
+    }
+
+
+def test_failed_media_is_in_manifest_before_message_append(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = FailedMediaThenInterruptSource()
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(export_guild(config, source))
+
+    assert json.loads(message_path.read_text())["id"] == "710"
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["failures"] == [
+        {
+            "channel_id": "100",
+            "error": "OSError",
+            "kind": "media",
+            "message_id": "710",
+            "media_id": "711",
+            "operation": "attachment",
+            "url": "https://cdn.example/bad",
+        }
+    ]
+
+
+def test_interrupted_media_is_retried_before_message_checkpoint(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = InterruptingMediaSource()
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(export_guild(config, source))
+
+    assert not message_path.exists()
+    assert not (root / "state.json").exists()
+
+    source.interrupt_media = False
+    asyncio.run(export_guild(config, source))
+
+    message = json.loads(message_path.read_text())
+    assert message["id"] == "720"
+    media_path = (
+        root / "channels" / "general--100" / "2021" / "media" / "720--721--retry.txt"
+    )
+    assert media_path.read_bytes() == b"retry bytes"
+    assert json.loads((root / "state.json").read_text())["channels"]["100"] == {
+        "complete": True,
+        "last_message_id": "720",
+        "last_message_timestamp": "2021-01-01T00:00:00+00:00",
     }
 
 

@@ -179,6 +179,7 @@ async def export_guild(
                             message_id = _record_id(record)
                             if message_id in existing_ids:
                                 continue
+                            previous_failure_count = len(media_failures)
                             enriched_messages = await _download_message_media(
                                 {year: [record]},
                                 channel_path,
@@ -188,6 +189,11 @@ async def export_guild(
                                 media_failures,
                                 channel_id,
                             )
+                            if len(media_failures) > previous_failure_count:
+                                media_failures[:] = _unique_failures(media_failures)
+                                _write_json(
+                                    config.export_root / "manifest.json", manifest
+                                )
                             enriched_record = enriched_messages[year][0]
                             year_path = channel_path / str(year)
                             year_path.mkdir(parents=True, exist_ok=True)
