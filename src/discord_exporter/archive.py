@@ -112,7 +112,16 @@ async def export_guild(
     else:
         progress.phase(f"Starting new archive at {config.export_root}")
 
+    config.export_root.mkdir(parents=True, exist_ok=True)
+    (config.export_root / "channels").mkdir(exist_ok=True)
+    (config.export_root / "media" / "avatars").mkdir(parents=True, exist_ok=True)
+    state = _load_state(state_path)
+    channel_states = state["channels"]
+    if not isinstance(channel_states, dict):
+        raise TypeError("Archive state has invalid channel entries")
+
     request_policy = config.request_policy
+    progress.phase("Fetching server metadata")
     normalized_guild = _stringify_ids(
         await _with_retries(
             lambda: source.fetch_guild(config.guild_id), request_policy.sleep
@@ -123,16 +132,9 @@ async def export_guild(
     if normalized_guild.get("id") != str(config.guild_id):
         raise ValueError("Discord returned a different guild than requested")
 
-    config.export_root.mkdir(parents=True, exist_ok=True)
-    (config.export_root / "channels").mkdir(exist_ok=True)
-    (config.export_root / "media" / "avatars").mkdir(parents=True, exist_ok=True)
-    state = _load_state(state_path)
-    channel_states = state["channels"]
-    if not isinstance(channel_states, dict):
-        raise TypeError("Archive state has invalid channel entries")
-
     media_failures = _load_previous_failures(config.export_root / "manifest.json")
-    members = await _download_member_avatars(
+    progress.phase("Fetching members and avatars")
+    members, avatar_counts = await _download_member_avatars(
         _member_records(
             await _with_retries(
                 lambda: source.fetch_members(config.guild_id), request_policy.sleep
@@ -143,12 +145,24 @@ async def export_guild(
         request_policy.sleep,
         media_failures,
     )
+    progress.phase(
+        "Avatars: "
+        f"{avatar_counts['downloaded']} downloaded, "
+        f"{avatar_counts['reused']} reused, "
+        f"{avatar_counts['failed']} failed"
+    )
+    progress.phase("Discovering channels, active threads, and archived threads")
     channels = _channel_records(
         await _with_retries(
             lambda: source.fetch_channels(config.guild_id), request_policy.sleep
         ),
         config.export_root,
     )
+    ordinary_channels = sum(
+        "thread" not in str(channel.get("type", "")) for channel in channels
+    )
+    threads = len(channels) - ordinary_channels
+    progress.phase(f"Discovered {ordinary_channels} channels and {threads} threads")
     manifest: dict[str, object] = {
         "channels": _manifest_channels(channels, channel_states),
         "export_finished_at": None,
@@ -163,11 +177,20 @@ async def export_guild(
     if not isinstance(failures, list):
         raise TypeError("Archive manifest has invalid failures")
     progress.set_total(len(channels))
+    metadata_paths = [
+        config.export_root / "server.json",
+        config.export_root / "members.jsonl",
+        config.export_root / "channels.jsonl",
+        config.export_root / "manifest.json",
+    ]
+    metadata_action = (
+        "Refreshing" if any(path.exists() for path in metadata_paths) else "Writing"
+    )
+    progress.phase(f"{metadata_action} metadata snapshots and manifest")
     complete, partial, missing = _checkpoint_summary(channels, channel_states)
     progress.phase(
         f"Checkpoint summary: {complete} complete, {partial} partial, {missing} missing"
     )
-
     _write_json(config.export_root / "server.json", normalized_guild)
     _write_jsonl(config.export_root / "members.jsonl", members)
     _write_jsonl(config.export_root / "channels.jsonl", channels)
@@ -334,9 +357,10 @@ async def _download_member_avatars(
     export_root: Path,
     sleep: Callable[[float], Awaitable[None]],
     failures: list[dict[str, str]],
-) -> list[Mapping[str, object]]:
+) -> tuple[list[Mapping[str, object]], dict[str, int]]:
     avatars_root = export_root / "media" / "avatars"
     enriched_members: list[Mapping[str, object]] = []
+    counts = {"downloaded": 0, "reused": 0, "failed": 0}
     for member in members:
         enriched = dict(member)
         avatar_url = member.get("avatar_url")
@@ -346,7 +370,9 @@ async def _download_member_avatars(
             suffix = Path(urlparse(avatar_url).path).suffix or ".bin"
             avatar_path = avatars_root / f"{member_id}--{avatar_id}{suffix}"
             try:
-                if not avatar_path.is_file():
+                if avatar_path.is_file():
+                    counts["reused"] += 1
+                else:
                     avatar_path.write_bytes(
                         await _with_retries(
                             lambda avatar_url=avatar_url: source.download_media(
@@ -355,6 +381,7 @@ async def _download_member_avatars(
                             sleep,
                         )
                     )
+                    counts["downloaded"] += 1
                 enriched["avatar_path"] = avatar_path.relative_to(
                     export_root
                 ).as_posix()
@@ -372,8 +399,9 @@ async def _download_member_avatars(
                         "error": type(error).__name__,
                     }
                 )
+                counts["failed"] += 1
         enriched_members.append(enriched)
-    return enriched_members
+    return enriched_members, counts
 
 
 async def _download_message_media(

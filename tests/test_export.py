@@ -331,6 +331,56 @@ class ErrorAfterFirstMessageSource(ChannelGuildSource):
             }
 
 
+class MetadataProgressSource(ChannelGuildSource):
+    async def fetch_channels(self, guild_id: int) -> list[dict[str, object]]:
+        assert guild_id == 123
+        return [
+            {
+                "id": 100,
+                "name": "general",
+                "type": "text",
+                "parent_id": None,
+                "accessible": True,
+            },
+            {
+                "id": 101,
+                "name": "random",
+                "type": "text",
+                "parent_id": None,
+                "accessible": True,
+            },
+            {
+                "id": 102,
+                "name": "general-thread",
+                "type": "public_thread",
+                "parent_id": 100,
+                "accessible": True,
+            },
+            {
+                "id": 103,
+                "name": "random-thread",
+                "type": "private_thread",
+                "parent_id": 101,
+                "accessible": True,
+            },
+            {
+                "id": 104,
+                "name": "another-thread",
+                "type": "public_thread",
+                "parent_id": 101,
+                "accessible": True,
+            },
+        ]
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        return []
+
+    async def fetch_messages_after(
+        self, channel_id: int, after_message_id: str
+    ) -> list[dict[str, object]]:
+        return []
+
+
 class MessageMediaGuildSource(ChannelGuildSource):
     def __init__(self) -> None:
         super().__init__()
@@ -1153,8 +1203,8 @@ def test_exporting_messages_reports_replaceable_tty_channel_progress(
     asyncio.run(export_guild(config, MessageGuildSource(), progress))
 
     output = progress.getvalue()
-    assert output.count("\n") == 4
-    assert output.count("\r\033[2K") == 9
+    assert output.count("\n") == 10
+    assert output.count("\r\033[2K") == 15
     assert (
         "\r\033[2KChannel 1/2 (50%): general [100] — starting full history; 0 new messages"
         in output
@@ -1226,6 +1276,45 @@ def test_progress_explains_archive_resume_and_durable_message_counts(
         second_output
     )
     assert "complete; 0 new messages" in second_output
+
+
+def test_progress_reports_metadata_phases_and_thread_counts(tmp_path: Path) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    progress = ProgressStream(tty=False)
+
+    asyncio.run(export_guild(config, MetadataProgressSource(), progress))
+
+    output = progress.getvalue()
+    phases = [
+        "Starting new archive at ",
+        "Fetching server metadata",
+        "Fetching members and avatars",
+        "Avatars: 0 downloaded, 0 reused, 0 failed",
+        "Discovering channels, active threads, and archived threads",
+        "Discovered 2 channels and 3 threads",
+        "Writing metadata snapshots and manifest",
+    ]
+    positions = [output.index(phase) for phase in phases]
+    assert positions == sorted(positions)
+    assert "Channel 1/5 (20%): general [100]" in output
+    assert "Channel 5/5 (100%): another-thread [104]" in output
+
+
+def test_progress_reports_metadata_refresh_and_avatar_reuse(tmp_path: Path) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = AvatarMemberGuildSource()
+    first_progress = ProgressStream(tty=False)
+    asyncio.run(export_guild(config, source, first_progress))
+
+    second_progress = ProgressStream(tty=False)
+    asyncio.run(export_guild(config, source, second_progress))
+
+    assert "Writing metadata snapshots and manifest" in first_progress.getvalue()
+    assert "Avatars: 1 downloaded, 0 reused, 0 failed" in first_progress.getvalue()
+    assert "Refreshing metadata snapshots and manifest" in second_progress.getvalue()
+    assert "Avatars: 0 downloaded, 1 reused, 0 failed" in second_progress.getvalue()
 
 
 def test_state_replacement_failure_keeps_previous_state_and_durable_messages(
