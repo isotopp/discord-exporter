@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TextIO
 from urllib.parse import urlparse
 
 import discord
@@ -31,7 +32,56 @@ class GuildSource(Protocol):
     async def download_media(self, url: str) -> bytes: ...
 
 
-async def export_guild(config: Config, source: GuildSource) -> None:
+class ArchiveFormatError(ValueError):
+    def __init__(self, path: Path, line_number: int) -> None:
+        self.path = path
+        super().__init__(f"invalid JSONL at {path}:{line_number}")
+
+
+class _Progress:
+    def __init__(self, stream: TextIO, total: int) -> None:
+        self.stream = stream
+        self.total = total
+        self.interactive = stream.isatty()
+
+    def update(self, position: int, channel: Mapping[str, object], status: str) -> None:
+        line = _progress_line(position, self.total, channel, status)
+        if self.interactive:
+            self.stream.write(f"\r\033[2K{line}")
+        else:
+            self.stream.write(f"{line}\n")
+        self.stream.flush()
+
+    def finish(self, position: int, channel: Mapping[str, object], status: str) -> None:
+        self.update(position, channel, status)
+        if self.interactive:
+            self.stream.write("\n")
+            self.stream.flush()
+
+    def abort(self) -> None:
+        if self.interactive:
+            self.stream.write("\n")
+            self.stream.flush()
+
+
+def _progress_line(
+    position: int, total: int, channel: Mapping[str, object], status: str
+) -> str:
+    name = _display_channel_name(channel.get("name"))
+    return (
+        f"Channel {position}/{total} ({position * 100 // total}%): "
+        f"{name} [{channel['id']}] — {status}"
+    )
+
+
+def _display_channel_name(value: object) -> str:
+    name = str(value or "channel")
+    return "".join(character if character.isprintable() else "?" for character in name)
+
+
+async def export_guild(
+    config: Config, source: GuildSource, progress_stream: TextIO | None = None
+) -> None:
     request_policy = config.request_policy
     normalized_guild = _stringify_ids(
         await _with_retries(
@@ -52,7 +102,7 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     if not isinstance(channel_states, dict):
         raise TypeError("Archive state has invalid channel entries")
 
-    media_failures: list[dict[str, str]] = []
+    media_failures = _load_previous_failures(config.export_root / "manifest.json")
     members = await _download_member_avatars(
         _member_records(
             await _with_retries(
@@ -83,14 +133,18 @@ async def export_guild(config: Config, source: GuildSource) -> None:
     failures = manifest["failures"]
     if not isinstance(failures, list):
         raise TypeError("Archive manifest has invalid failures")
+    progress = _Progress(
+        sys.stderr if progress_stream is None else progress_stream, len(channels)
+    )
 
     _write_json(config.export_root / "server.json", normalized_guild)
     _write_jsonl(config.export_root / "members.jsonl", members)
     _write_jsonl(config.export_root / "channels.jsonl", channels)
     _write_json(config.export_root / "manifest.json", manifest)
 
-    for channel in channels:
+    for position, channel in enumerate(channels, 1):
         channel_id = str(channel["id"])
+        progress.update(position, channel, "exporting")
         try:
             if channel.get("accessible", True) is False:
                 channel_states[channel_id] = _incomplete_channel_state()
@@ -98,37 +152,52 @@ async def export_guild(config: Config, source: GuildSource) -> None:
                     failures.append(
                         _failure_record("channel", channel_id, channel["access_error"])
                     )
+                progress.finish(position, channel, "skipped")
             else:
+                channel_path = config.export_root / str(channel["archive_path"])
+                resume_cursor = _resume_cursor(
+                    channel_path, channel_states.get(channel_id)
+                )
                 messages = _message_records(
                     await _fetch_channel_messages(
-                        source, int(channel_id), request_policy.sleep
+                        source,
+                        int(channel_id),
+                        request_policy.sleep,
+                        resume_cursor,
                     ),
                     channel_id,
                 )
                 messages = await _download_message_media(
                     messages,
-                    config.export_root / str(channel["archive_path"]),
+                    channel_path,
                     config.export_root,
                     source,
                     request_policy.sleep,
                     media_failures,
                     channel_id,
                 )
-                _write_message_files(
-                    config.export_root / str(channel["archive_path"]),
-                    messages,
-                    channel_id,
+                archived_messages = _write_message_files(
+                    channel_path, messages, channel_id
                 )
-                channel_states[channel_id] = _complete_channel_state(messages)
-        except (discord.DiscordException, OSError) as error:
-            failures.append(_failure_record("messages", channel_id, error))
+                channel_states[channel_id] = _complete_channel_state(archived_messages)
+                progress.finish(position, channel, "complete")
+        except (discord.DiscordException, OSError, TypeError, ValueError) as error:
+            failure = _failure_record("messages", channel_id, error)
+            if isinstance(error, ArchiveFormatError):
+                failure["path"] = str(error.path)
+            failures.append(failure)
             channel_states[channel_id] = _incomplete_channel_state()
+            progress.finish(position, channel, "failed")
+        except KeyboardInterrupt:
+            progress.abort()
+            raise
         manifest["channels"] = _manifest_channels(channels, channel_states)
         manifest["incomplete_channels"] = _incomplete_channel_ids(
             channels, channel_states
         )
         _write_state_atomic(state_path, state)
         _write_json(config.export_root / "manifest.json", manifest)
+    media_failures[:] = _unique_failures(media_failures)
     incomplete_channels = _incomplete_channel_ids(channels, channel_states)
     manifest["incomplete_channels"] = incomplete_channels
     manifest["export_finished_at"] = datetime.now(UTC).isoformat()
@@ -162,6 +231,32 @@ def _failure_record(operation: str, object_id: str, error: object) -> dict[str, 
         "channel_id": object_id,
         "error": type(error).__name__,
     }
+
+
+def _load_previous_failures(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping) or not isinstance(value.get("failures"), list):
+        return []
+    failures: list[dict[str, str]] = []
+    for failure in value["failures"]:
+        if isinstance(failure, Mapping) and all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in failure.items()
+        ):
+            failures.append(dict(failure))
+    return failures
+
+
+def _unique_failures(
+    failures: Sequence[dict[str, str]],
+) -> list[dict[str, str]]:
+    unique: list[dict[str, str]] = []
+    for failure in failures:
+        if failure not in unique:
+            unique.append(failure)
+    return unique
 
 
 async def _download_member_avatars(
@@ -511,12 +606,15 @@ async def _fetch_channel_messages(
     source: GuildSource,
     channel_id: int,
     sleep: Callable[[float], Awaitable[None]],
+    after_message_id: str | None = None,
 ) -> list[Mapping[str, object]]:
-    records = list(
-        await _with_retries(lambda: source.fetch_messages(channel_id), sleep)
+    records = (
+        []
+        if after_message_id is not None
+        else list(await _with_retries(lambda: source.fetch_messages(channel_id), sleep))
     )
     seen_ids = {_record_id(record) for record in records}
-    cursor = _latest_message_id(records) or "0"
+    cursor = after_message_id or _latest_message_id(records) or "0"
     while cursor is not None:
         current_cursor = cursor
         newer_records = await _with_retries(
@@ -534,6 +632,25 @@ async def _fetch_channel_messages(
         seen_ids.update(_record_id(record) for record in fresh_records)
         cursor = _latest_message_id(records)
     return records
+
+
+def _resume_cursor(channel_path: Path, channel_state: object) -> str | None:
+    existing_records = _read_existing_messages(
+        sorted(channel_path.glob("*/messages.jsonl"))
+    )
+    last_message_id = (
+        channel_state.get("last_message_id")
+        if isinstance(channel_state, Mapping)
+        else None
+    )
+    existing_ids = {_record_id(record) for record in existing_records}
+    if last_message_id is not None and last_message_id not in existing_ids:
+        return None
+    if existing_records:
+        return _latest_message_id(existing_records)
+    if isinstance(channel_state, Mapping) and channel_state.get("complete") is True:
+        return "0"
+    return None
 
 
 def _record_id(record: Mapping[str, object]) -> str:
@@ -573,23 +690,27 @@ def _write_message_files(
     channel_path: Path,
     messages: Mapping[int, Sequence[Mapping[str, object]]],
     channel_id: str,
-) -> None:
+) -> dict[int, list[Mapping[str, object]]]:
     existing_paths = sorted(channel_path.glob("*/messages.jsonl"))
     existing_records = _read_existing_messages(existing_paths)
     current_records = [
         record for records_in_year in messages.values() for record in records_in_year
     ]
+    existing_ids = {_record_id(record) for record in existing_records}
+    new_records = []
+    for record in current_records:
+        if _record_id(record) not in existing_ids:
+            existing_ids.add(_record_id(record))
+            new_records.append(record)
+    new_messages = _message_records(new_records, channel_id)
+    for year, records in sorted(new_messages.items()):
+        year_path = channel_path / str(year)
+        year_path.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(year_path / "messages.jsonl", records)
     merged_messages = _message_records(
         [*existing_records, *current_records], channel_id
     )
-    written_years = set(merged_messages)
-    for path in existing_paths:
-        if path.parent.name not in {str(year) for year in written_years}:
-            path.unlink()
-    for year, records in sorted(merged_messages.items()):
-        year_path = channel_path / str(year)
-        year_path.mkdir(parents=True, exist_ok=True)
-        _write_jsonl(year_path / "messages.jsonl", records)
+    return merged_messages
 
 
 def _read_existing_messages(paths: Sequence[Path]) -> list[Mapping[str, object]]:
@@ -668,6 +789,13 @@ def _write_json(path: Path, value: object) -> None:
 
 def _write_jsonl(path: Path, values: Sequence[object]) -> None:
     with path.open("w", encoding="utf-8") as file:
+        for value in values:
+            json.dump(value, file, ensure_ascii=False, sort_keys=True)
+            file.write("\n")
+
+
+def _append_jsonl(path: Path, values: Sequence[object]) -> None:
+    with path.open("a", encoding="utf-8") as file:
         for value in values:
             json.dump(value, file, ensure_ascii=False, sort_keys=True)
             file.write("\n")

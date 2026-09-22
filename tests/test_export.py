@@ -117,6 +117,51 @@ class ChannelGuildSource(MemberGuildSource):
         return []
 
 
+class ResumeGuildSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.full_channels: list[int] = []
+        self.after_calls: list[tuple[int, str]] = []
+        self.has_new_message = False
+
+    async def fetch_messages(self, channel_id: int) -> list[dict[str, object]]:
+        self.full_channels.append(channel_id)
+        if channel_id == 100:
+            return [
+                {
+                    "id": 200,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:00:00+00:00",
+                    "content": "first",
+                },
+                {
+                    "id": 201,
+                    "channel_id": 100,
+                    "author_id": 111,
+                    "created_at": "2021-01-01T00:01:00+00:00",
+                    "content": "second",
+                },
+            ]
+        return await super().fetch_messages(channel_id)
+
+    async def fetch_messages_after(
+        self, channel_id: int, after_message_id: str
+    ) -> list[dict[str, object]]:
+        self.after_calls.append((channel_id, after_message_id))
+        if channel_id == 100 and after_message_id == "201" and self.has_new_message:
+            return [
+                {
+                    "id": 202,
+                    "channel_id": 100,
+                    "author_id": 222,
+                    "created_at": "2021-01-01T00:02:00+00:00",
+                    "content": "arrived later",
+                }
+            ]
+        return []
+
+
 class MessageMediaGuildSource(ChannelGuildSource):
     def __init__(self) -> None:
         super().__init__()
@@ -473,6 +518,35 @@ def test_member_avatars_are_downloaded_once_and_referenced_relatively(
     ).read_bytes() == b"avatar-bytes"
 
 
+def test_resume_appends_new_messages_after_the_durable_cursor(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = ResumeGuildSource()
+
+    asyncio.run(export_guild(config, source))
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+    original_bytes = message_path.read_bytes()
+
+    source.has_new_message = True
+    asyncio.run(export_guild(config, source))
+
+    assert source.full_channels.count(100) == 1
+    assert (100, "201") in source.after_calls
+    assert (100, "201") in source.after_calls[2:]
+    assert (101, "0") in source.after_calls
+    assert message_path.read_bytes().startswith(original_bytes)
+    assert [
+        json.loads(line)["id"] for line in message_path.read_text().splitlines()
+    ] == ["200", "201", "202"]
+    assert json.loads((root / "state.json").read_text())["channels"]["100"] == {
+        "complete": True,
+        "last_message_id": "202",
+        "last_message_timestamp": "2021-01-01T00:02:00+00:00",
+    }
+
+
 def test_message_media_uses_stable_paths_and_reuses_existing_downloads(
     tmp_path: Path,
 ) -> None:
@@ -553,7 +627,7 @@ def test_media_failures_are_durable_without_blocking_other_media_or_channels(
     ]
     assert source.downloads.count("https://cdn.example/good") == 1
     assert source.downloads.count("https://cdn.example/avatar-bad") == 2
-    assert source.downloads.count("https://cdn.example/message-bad") == 2
+    assert source.downloads.count("https://cdn.example/message-bad") == 1
 
 
 def test_exporting_channels_keeps_ids_stable_when_a_channel_is_renamed(
