@@ -7,6 +7,9 @@ instead of fetching every channel's complete history again. Preserve the
 existing guarantees that state never advances beyond durable data and that a
 stale checkpoint cannot cause messages to be skipped.
 
+Give the operator compact live feedback during long runs while retaining one
+durable terminal line for every channel that finishes processing.
+
 ## Bug description
 
 The exporter is restart-safe but not genuinely resumable. It preserves
@@ -58,13 +61,15 @@ load and the configured pacing delay.
   `developer/2026-09-21-restartable-discord-export/user-stories.md:135-153`
   explicitly requires resume without starting over or skipping messages.
 
-## User story
+## User stories
+
+### 1. Resume from durable channel progress
 
 As an archive operator, I want a restarted export to continue from the newest
 durable per-channel checkpoint, so that interrupting a multi-day export does
 not repeat completed history or skip messages.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 - The public command remains `uv run discord-exporter`; no manual resume flag
   is required when the configured export root contains an existing archive.
@@ -87,12 +92,53 @@ not repeat completed history or skip messages.
 - Tests observe whether the full-history or incremental Discord boundary was
   called and verify the completed archive through its public files.
 
+### 2. Report live per-channel progress
+
+As an archive operator, I want the active channel and overall channel position
+shown while an export runs, so that I can distinguish slow progress from a
+stalled process and retain a concise record of completed channels.
+
+The current command provides no live progress. `src/discord_exporter/__init__.py`
+prints only after `export_guild()` returns, and the channel loop in
+`src/discord_exporter/archive.py` emits no status while work is in progress.
+
+#### Acceptance criteria
+
+- Once the channel catalogue is known, progress identifies the active channel
+  by sanitized name and Discord channel ID.
+- Progress includes an incrementing channel position such as `7/30` and, when
+  the total is known, a channel-position percentage such as `23%`.
+- The percentage is explicitly channel-based; it does not claim to represent
+  messages, bytes, elapsed time, or equal amounts of work.
+- While a channel is active, status updates replace one terminal line using a
+  carriage return and line clearing rather than printing new lines.
+- Whenever processing of a channel finishes, including completion, skip, or
+  recorded failure, its final status replaces the active line and prints a
+  newline. The next channel then starts progress on a new active line.
+- Before a total channel count is available, phase status may omit the counter
+  and percentage.
+- Completion, failure, and operator interruption leave the terminal at the
+  beginning of a clean new line.
+- When the progress stream is not an interactive terminal, output contains no
+  terminal-control sequences and uses ordinary newline-delimited status.
+- Progress is written to `stderr`, is flushed promptly, and never includes bot
+  credentials or message content.
+- Channel names cannot inject control sequences or force additional terminal
+  lines; long display names may be truncated for the active terminal width.
+- The final command message describes the actual result as complete or
+  incomplete rather than saying that an already-finished export was merely
+  initialized.
+- The behavior uses the Python standard library and does not require an
+  additional terminal-rendering dependency.
+
 ## Scope
 
 - Reconcile global channel state with durable per-channel JSONL.
 - Select full-history or incremental fetching independently per channel.
 - Resume completed and interrupted channels from proven durable cursors.
 - Preserve atomic state replacement and existing failure isolation.
+- Report single-line live progress and retain one final line per processed
+  channel.
 - Keep the archive format and command-line interface compatible.
 
 ## Out of scope
@@ -101,10 +147,13 @@ not repeat completed history or skip messages.
 - Detecting edits or deletions to messages at or before a durable cursor.
 - Parallel channel export.
 - Changing yearly archive sharding or media layout.
-- Adding interactive controls or a graphical progress display.
+- Interactive controls, a graphical interface, and message- or byte-level
+  completion percentages.
 
 ## Completion criteria
 
-The epic is complete when a test can interrupt an export after durable channel
+The epic is complete when tests can interrupt an export after durable channel
 progress, restart it, and prove that only messages after the reconciled cursor
-are requested while the final archive remains complete and deduplicated.
+are requested while the final archive remains complete and deduplicated. A
+run must also expose the active channel on one changing terminal line and
+retain one final newline-terminated status line for each processed channel.
