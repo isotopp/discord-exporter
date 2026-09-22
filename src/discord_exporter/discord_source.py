@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import urllib.request
+from collections.abc import AsyncIterator
 from typing import Any
 
 import discord
@@ -102,6 +103,28 @@ class DiscordGuildSource:
             ):
                 messages.append(_message_record(message))
             return messages
+        finally:
+            await client.close()
+
+    async def iter_messages(
+        self, channel_id: int, after_message_id: str | None = None
+    ) -> AsyncIterator[dict[str, object]]:
+        client = self._client(discord.Intents.none())
+        try:
+            await client.login(self.token)
+            channel = await client.fetch_channel(channel_id)
+            if not isinstance(channel, discord.abc.Messageable):
+                return
+            if after_message_id is None:
+                history = channel.history(limit=None, oldest_first=True)
+            else:
+                history = channel.history(
+                    limit=None,
+                    after=discord.Object(id=int(after_message_id)),
+                    oldest_first=True,
+                )
+            async for message in history:
+                yield _message_record(message)
         finally:
             await client.close()
 

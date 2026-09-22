@@ -1,7 +1,7 @@
 import asyncio
 import io
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
 import discord
@@ -48,6 +48,32 @@ class EmptyGuildSource:
     ) -> list[dict[str, object]]:
         assert after_message_id
         return []
+
+    async def iter_messages(
+        self, channel_id: int, after_message_id: str | None
+    ) -> AsyncIterator[dict[str, object]]:
+        seen: set[str] = set()
+        if after_message_id is None:
+            records = await self.fetch_messages(channel_id)
+            cursor = "0"
+        else:
+            records = []
+            cursor = after_message_id
+
+        while True:
+            records.sort(
+                key=lambda record: (str(record["created_at"]), str(record["id"]))
+            )
+            for record in records:
+                message_id = str(record["id"])
+                if message_id not in seen:
+                    seen.add(message_id)
+                    yield record
+                    cursor = message_id
+
+            records = await self.fetch_messages_after(channel_id, cursor)
+            if not records:
+                return
 
     async def download_media(self, url: str) -> bytes:
         assert url
@@ -170,6 +196,49 @@ class ResumeGuildSource(ChannelGuildSource):
                 }
             ]
         return []
+
+
+class InterruptingStreamGuildSource(ChannelGuildSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupt_after_first = True
+        self.cursors: list[tuple[int, str | None]] = []
+
+    async def iter_messages(
+        self, channel_id: int, after_message_id: str | None
+    ) -> AsyncIterator[dict[str, object]]:
+        self.cursors.append((channel_id, after_message_id))
+        if channel_id != 100:
+            return
+
+        messages: list[dict[str, object]] = [
+            {
+                "id": 700,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:00:00+00:00",
+                "content": "first",
+            },
+            {
+                "id": 701,
+                "channel_id": 100,
+                "author_id": 111,
+                "created_at": "2021-01-01T00:01:00+00:00",
+                "content": "second",
+            },
+        ]
+        start = 0
+        if after_message_id is not None:
+            start = next(
+                index + 1
+                for index, message in enumerate(messages)
+                if str(message["id"]) == after_message_id
+            )
+
+        for message in messages[start:]:
+            yield message
+            if self.interrupt_after_first and message["id"] == 700:
+                raise KeyboardInterrupt
 
 
 class MessageMediaGuildSource(ChannelGuildSource):
@@ -554,6 +623,46 @@ def test_resume_appends_new_messages_after_the_durable_cursor(
         "complete": True,
         "last_message_id": "202",
         "last_message_timestamp": "2021-01-01T00:02:00+00:00",
+    }
+
+
+def test_interrupted_stream_leaves_a_durable_message_checkpoint(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    source = InterruptingStreamGuildSource()
+    message_path = root / "channels" / "general--100" / "2021" / "messages.jsonl"
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(export_guild(config, source))
+
+    assert [
+        json.loads(line)["id"] for line in message_path.read_text().splitlines()
+    ] == ["700"]
+    assert json.loads((root / "state.json").read_text())["channels"]["100"] == {
+        "complete": False,
+        "last_message_id": "700",
+        "last_message_timestamp": "2021-01-01T00:00:00+00:00",
+    }
+
+    source.interrupt_after_first = False
+    asyncio.run(export_guild(config, source))
+
+    assert [cursor for channel_id, cursor in source.cursors if channel_id == 100] == [
+        None,
+        "700",
+    ]
+    assert [
+        json.loads(line)["id"] for line in message_path.read_text().splitlines()
+    ] == [
+        "700",
+        "701",
+    ]
+    assert json.loads((root / "state.json").read_text())["channels"]["100"] == {
+        "complete": True,
+        "last_message_id": "701",
+        "last_message_timestamp": "2021-01-01T00:01:00+00:00",
     }
 
 

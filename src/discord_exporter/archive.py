@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TextIO
@@ -28,6 +28,10 @@ class GuildSource(Protocol):
     async def fetch_messages_after(
         self, channel_id: int, after_message_id: str
     ) -> Sequence[Mapping[str, object]]: ...
+
+    def iter_messages(
+        self, channel_id: int, after_message_id: str | None
+    ) -> AsyncIterator[Mapping[str, object]]: ...
 
     async def download_media(self, url: str) -> bytes: ...
 
@@ -155,30 +159,48 @@ async def export_guild(
                 progress.finish(position, channel, "skipped")
             else:
                 channel_path = config.export_root / str(channel["archive_path"])
+                existing_records = _read_existing_messages(
+                    sorted(channel_path.glob("*/messages.jsonl"))
+                )
                 resume_cursor = _resume_cursor(
-                    channel_path, channel_states.get(channel_id)
+                    existing_records, channel_states.get(channel_id)
                 )
-                messages = _message_records(
-                    await _fetch_channel_messages(
-                        source,
-                        int(channel_id),
-                        request_policy.sleep,
-                        resume_cursor,
-                    ),
-                    channel_id,
-                )
-                messages = await _download_message_media(
-                    messages,
-                    channel_path,
-                    config.export_root,
+                existing_ids = {_record_id(record) for record in existing_records}
+                archived_records = list(existing_records)
+                async for raw_message in _iter_channel_messages(
                     source,
+                    int(channel_id),
                     request_policy.sleep,
-                    media_failures,
-                    channel_id,
-                )
-                archived_messages = _write_message_files(
-                    channel_path, messages, channel_id
-                )
+                    resume_cursor,
+                ):
+                    messages = _message_records([raw_message], channel_id)
+                    for year, records in messages.items():
+                        for record in records:
+                            message_id = _record_id(record)
+                            if message_id in existing_ids:
+                                continue
+                            enriched_messages = await _download_message_media(
+                                {year: [record]},
+                                channel_path,
+                                config.export_root,
+                                source,
+                                request_policy.sleep,
+                                media_failures,
+                                channel_id,
+                            )
+                            enriched_record = enriched_messages[year][0]
+                            year_path = channel_path / str(year)
+                            year_path.mkdir(parents=True, exist_ok=True)
+                            _append_jsonl(
+                                year_path / "messages.jsonl", [enriched_record]
+                            )
+                            existing_ids.add(message_id)
+                            archived_records.append(enriched_record)
+                            channel_states[channel_id] = _message_channel_state(
+                                enriched_record, complete=False
+                            )
+                            _write_state_atomic(state_path, state)
+                archived_messages = _message_records(archived_records, channel_id)
                 channel_states[channel_id] = _complete_channel_state(archived_messages)
                 progress.finish(position, channel, "complete")
         except (discord.DiscordException, OSError, TypeError, ValueError) as error:
@@ -186,7 +208,9 @@ async def export_guild(
             if isinstance(error, ArchiveFormatError):
                 failure["path"] = str(error.path)
             failures.append(failure)
-            channel_states[channel_id] = _incomplete_channel_state()
+            channel_states[channel_id] = _incomplete_channel_state(
+                channel_states.get(channel_id)
+            )
             progress.finish(position, channel, "failed")
         except KeyboardInterrupt:
             progress.abort()
@@ -602,42 +626,35 @@ def _message_records(
     return by_year
 
 
-async def _fetch_channel_messages(
+async def _iter_channel_messages(
     source: GuildSource,
     channel_id: int,
     sleep: Callable[[float], Awaitable[None]],
     after_message_id: str | None = None,
-) -> list[Mapping[str, object]]:
-    records = (
-        []
-        if after_message_id is not None
-        else list(await _with_retries(lambda: source.fetch_messages(channel_id), sleep))
-    )
-    seen_ids = {_record_id(record) for record in records}
-    cursor = after_message_id or _latest_message_id(records) or "0"
-    while cursor is not None:
-        current_cursor = cursor
-        newer_records = await _with_retries(
-            lambda current_cursor=current_cursor: source.fetch_messages_after(
-                channel_id, current_cursor
-            ),
-            sleep,
-        )
-        fresh_records = [
-            record for record in newer_records if _record_id(record) not in seen_ids
-        ]
-        if not fresh_records:
-            break
-        records.extend(fresh_records)
-        seen_ids.update(_record_id(record) for record in fresh_records)
-        cursor = _latest_message_id(records)
-    return records
+) -> AsyncIterator[Mapping[str, object]]:
+    cursor = after_message_id
+    attempt = 0
+    while True:
+        try:
+            async for record in source.iter_messages(channel_id, cursor):
+                cursor = _record_id(record)
+                yield record
+            return
+        except discord.RateLimited as error:
+            if attempt == 2:
+                raise
+            attempt += 1
+            await sleep(error.retry_after)
+        except discord.DiscordServerError:
+            if attempt == 2:
+                raise
+            attempt += 1
+            await sleep(float(2 ** (attempt - 1)))
 
 
-def _resume_cursor(channel_path: Path, channel_state: object) -> str | None:
-    existing_records = _read_existing_messages(
-        sorted(channel_path.glob("*/messages.jsonl"))
-    )
+def _resume_cursor(
+    existing_records: Sequence[Mapping[str, object]], channel_state: object
+) -> str | None:
     last_message_id = (
         channel_state.get("last_message_id")
         if isinstance(channel_state, Mapping)
@@ -744,11 +761,32 @@ def _load_state(path: Path) -> dict[str, object]:
     return value
 
 
-def _incomplete_channel_state() -> dict[str, object]:
+def _incomplete_channel_state(previous: object = None) -> dict[str, object]:
+    if isinstance(previous, Mapping):
+        return {
+            "last_message_id": previous.get("last_message_id"),
+            "last_message_timestamp": previous.get("last_message_timestamp"),
+            "complete": False,
+        }
+    return _message_channel_state(None, complete=False)
+
+
+def _message_channel_state(
+    message: Mapping[str, object] | None, *, complete: bool
+) -> dict[str, object]:
+    if message is None:
+        return {
+            "last_message_id": None,
+            "last_message_timestamp": None,
+            "complete": complete,
+        }
+    timestamp = message.get("created_at")
+    if not isinstance(timestamp, str):
+        raise TypeError("Discord returned a message without a creation timestamp")
     return {
-        "last_message_id": None,
-        "last_message_timestamp": None,
-        "complete": False,
+        "last_message_id": _record_id(message),
+        "last_message_timestamp": timestamp,
+        "complete": complete,
     }
 
 
