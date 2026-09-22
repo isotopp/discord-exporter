@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 from collections.abc import AsyncIterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import discord
@@ -18,6 +19,16 @@ class ProgressStream(io.StringIO):
 
     def isatty(self) -> bool:
         return self.tty
+
+
+def _without_failure_timestamps(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise TypeError("expected a failure list")
+    return [
+        {key: item for key, item in failure.items() if key != "occurred_at"}
+        for failure in value
+        if isinstance(failure, Mapping)
+    ]
 
 
 class EmptyGuildSource:
@@ -819,7 +830,7 @@ def test_failed_media_is_in_manifest_before_message_append(
 
     assert json.loads(message_path.read_text())["id"] == "710"
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["failures"] == [
+    assert _without_failure_timestamps(manifest["failures"]) == [
         {
             "channel_id": "100",
             "error": "OSError",
@@ -954,7 +965,7 @@ def test_media_failures_are_durable_without_blocking_other_media_or_channels(
     assert "download_error" in messages[0]["attachments"][1]
     assert manifest["status"] == "complete"
     assert manifest["incomplete_channels"] == []
-    assert manifest["failures"] == [
+    assert _without_failure_timestamps(manifest["failures"]) == [
         {
             "kind": "media",
             "operation": "avatar",
@@ -1392,7 +1403,7 @@ def test_malformed_jsonl_is_reported_without_touching_the_channel(
     assert state["101"]["complete"] is True
     manifest = json.loads((root / "manifest.json").read_text())
     assert manifest["incomplete_channels"] == ["100"]
-    assert manifest["failures"] == [
+    assert _without_failure_timestamps(manifest["failures"]) == [
         {
             "channel_id": "100",
             "error": "ArchiveFormatError",
@@ -1477,13 +1488,30 @@ def test_permanent_channel_failure_is_recorded_without_stopping_other_channels(
 
     asyncio.run(export_guild(config, FailedChannelGuildSource()))
 
-    assert json.loads((root / "manifest.json").read_text())["failures"] == [
-        {"channel_id": "100", "error": "OSError", "operation": "messages"}
-    ]
+    assert _without_failure_timestamps(
+        json.loads((root / "manifest.json").read_text())["failures"]
+    ) == [{"channel_id": "100", "error": "OSError", "operation": "messages"}]
     state = json.loads((root / "state.json").read_text())["channels"]
     assert state["100"]["complete"] is False
     assert state["101"]["complete"] is True
     assert (root / "channels" / "discussion--101" / "2021" / "messages.jsonl").is_file()
+
+
+def test_failed_progress_and_manifest_include_current_error_details(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export"
+    config = Config(token="test-token", guild_id=123, export_root=root)
+    progress = ProgressStream(tty=False)
+
+    asyncio.run(export_guild(config, FailedChannelGuildSource(), progress))
+
+    assert (
+        "failed; 0 new messages (OSError: network unavailable)" in progress.getvalue()
+    )
+    failure = json.loads((root / "manifest.json").read_text())["failures"][0]
+    assert failure["error"] == "OSError"
+    assert datetime.fromisoformat(failure["occurred_at"]).tzinfo == UTC
 
 
 def test_completed_manifest_keeps_archive_paths_portable_after_relocation(

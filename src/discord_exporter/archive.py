@@ -271,7 +271,11 @@ async def export_guild(
             channel_states[channel_id] = _incomplete_channel_state(
                 channel_states.get(channel_id)
             )
-            progress.finish(position, channel, f"failed; {new_count} new messages")
+            progress.finish(
+                position,
+                channel,
+                f"failed; {new_count} new messages ({_progress_error(error)})",
+            )
         except KeyboardInterrupt:
             progress.abort()
             raise
@@ -310,10 +314,28 @@ async def _with_retries[T](
 
 
 def _failure_record(operation: str, object_id: str, error: object) -> dict[str, str]:
+    return _timestamped_failure(
+        {
+            "operation": operation,
+            "channel_id": object_id,
+            "error": type(error).__name__,
+        }
+    )
+
+
+def _progress_error(error: object) -> str:
+    details = str(error).replace("\r", " ").replace("\n", " ").strip()
+    if len(details) > 200:
+        details = f"{details[:197]}..."
+    if not details:
+        return type(error).__name__
+    return f"{type(error).__name__}: {details}"
+
+
+def _timestamped_failure(failure: Mapping[str, str]) -> dict[str, str]:
     return {
-        "operation": operation,
-        "channel_id": object_id,
-        "error": type(error).__name__,
+        **failure,
+        "occurred_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -337,9 +359,20 @@ def _unique_failures(
     failures: Sequence[dict[str, str]],
 ) -> list[dict[str, str]]:
     unique: list[dict[str, str]] = []
+    indexes: dict[tuple[tuple[str, str], ...], int] = {}
     for failure in failures:
-        if failure not in unique:
+        key = tuple(
+            sorted(
+                (name, value)
+                for name, value in failure.items()
+                if name != "occurred_at"
+            )
+        )
+        if key not in indexes:
+            indexes[key] = len(unique)
             unique.append(failure)
+        elif "occurred_at" in failure:
+            unique[indexes[key]] = failure
     return unique
 
 
@@ -383,13 +416,15 @@ async def _download_member_avatars(
                     "error": type(error).__name__,
                 }
                 failures.append(
-                    {
-                        "kind": "media",
-                        "operation": "avatar",
-                        "user_id": member_id,
-                        "url": avatar_url,
-                        "error": type(error).__name__,
-                    }
+                    _timestamped_failure(
+                        {
+                            "kind": "media",
+                            "operation": "avatar",
+                            "user_id": member_id,
+                            "url": avatar_url,
+                            "error": type(error).__name__,
+                        }
+                    )
                 )
                 counts["failed"] += 1
         enriched_members.append(enriched)
@@ -483,15 +518,17 @@ async def _download_attachment(
             "error": type(error).__name__,
         }
         failures.append(
-            {
-                "channel_id": channel_id,
-                "error": type(error).__name__,
-                "kind": "media",
-                "message_id": message_id,
-                "media_id": attachment_id,
-                "operation": "attachment",
-                "url": url,
-            }
+            _timestamped_failure(
+                {
+                    "channel_id": channel_id,
+                    "error": type(error).__name__,
+                    "kind": "media",
+                    "message_id": message_id,
+                    "media_id": attachment_id,
+                    "operation": "attachment",
+                    "url": url,
+                }
+            )
         )
     return enriched
 
@@ -534,15 +571,17 @@ async def _download_embed_images(
                 "error": type(error).__name__,
             }
             failures.append(
-                {
-                    "channel_id": channel_id,
-                    "error": type(error).__name__,
-                    "kind": "media",
-                    "message_id": message_id,
-                    "media_id": asset_id,
-                    "operation": "embed_image",
-                    "url": url,
-                }
+                _timestamped_failure(
+                    {
+                        "channel_id": channel_id,
+                        "error": type(error).__name__,
+                        "kind": "media",
+                        "message_id": message_id,
+                        "media_id": asset_id,
+                        "operation": "embed_image",
+                        "url": url,
+                    }
+                )
             )
         enriched[key] = enriched_image
     return enriched

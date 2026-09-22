@@ -70,7 +70,7 @@ For each message, the durable order is:
 
 The channel is marked complete only after its history stream reports no newer message. A message count is shown only after both the JSONL append and checkpoint replacement succeed. Existing JSONL ahead of the checkpoint is treated as durable, so an interrupted write is not replayed. If the checkpoint ID is absent from otherwise valid JSONL, the exporter deliberately starts that channel from full history and deduplicates existing IDs.
 
-If a JSONL file contains invalid JSON or a final unterminated line, the exporter leaves it untouched, records an incomplete channel and an `ArchiveFormatError` in `manifest.json`, and continues with other channels. Repair or remove only the damaged line/file after reviewing the archive, then rerun the same command. Never edit a JSONL file while the exporter is running.
+If a JSONL file contains invalid JSON or a final unterminated line, the exporter leaves it untouched, records an incomplete channel and an `ArchiveFormatError` in `manifest.json`, and continues with other channels. New failure records include an `occurred_at` timestamp; older retained failures may not. Repair or remove only the damaged line/file after reviewing the archive, then rerun the same command. Never edit a JSONL file while the exporter is running.
 
 Threads are exported as channels because they have their own message history and checkpoint. The denominator and progress position include both ordinary channels and discovered active or archived threads.
 
