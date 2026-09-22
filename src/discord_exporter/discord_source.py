@@ -112,14 +112,10 @@ class DiscordGuildSource:
 
     def _client(self, intents: discord.Intents) -> discord.Client:
         client = discord.Client(intents=intents)
-        client.http.user_agent = self.request_policy.user_agent
         original_request = client.http.request
 
         async def paced_request(*args: Any, **kwargs: Any) -> Any:
             await self.request_policy.before_request()
-            session = getattr(client.http, "_HTTPClient__session", None)
-            if session is not None:
-                session.headers.update(self.request_policy.headers)
             return await original_request(*args, **kwargs)
 
         setattr(client.http, "request", paced_request)  # noqa: B010

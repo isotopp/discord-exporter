@@ -210,8 +210,8 @@ Observable behavior:
 
 - Each exporter-controlled HTTPS request is separated by a random delay within
   the configured minimum and maximum.
-- The configured Firefox user agent is sent with gzip/deflate content-encoding
-  and language headers at supported HTTP boundaries.
+- Discord API requests retain discord.py's native bot headers; media downloads
+  use the configured Firefox user agent with gzip/deflate and language headers.
 - Invalid delay ranges or a missing user agent fail configuration validation.
 - Tests observe request timing and headers through the external boundary with
   controlled time and randomness.

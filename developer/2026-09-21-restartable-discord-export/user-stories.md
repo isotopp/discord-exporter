@@ -168,10 +168,9 @@ Acceptance criteria:
 - Progress and errors are observable without logging message contents or bot
   credentials unnecessarily.
 - The export is handled at a configurable, moderated pace, with a randomly jittered delay between each HTTPS request.
-- The access happens with a browser user-agent, simulating a Firefox current user-agent. I can provide one, if requested.
-- The access requests only gzip or deflate response compression, which the
-  Python client can decode without an optional Brotli dependency, and sends
-  Firefox-like language headers.
+- Discord API requests retain discord.py's native bot identity.
+- Media downloads use the configured Firefox-like user agent and language
+  headers, and request only gzip or deflate response compression.
 
 ### 7. Produce a verifiable migration handoff
 
