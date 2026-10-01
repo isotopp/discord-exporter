@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import urllib.request
 from collections.abc import AsyncIterator
 from typing import Any
@@ -95,9 +96,15 @@ class DiscordGuildSource:
             await client.close()
 
     async def download_media(self, url: str) -> bytes:
-        await self.request_policy.before_request()
         request = urllib.request.Request(url, headers=self.request_policy.headers)
-        return await asyncio.to_thread(_read_url, request)
+        for attempt in range(3):
+            await self.request_policy.before_request()
+            try:
+                return await asyncio.to_thread(_read_url, request)
+            except http.client.IncompleteRead as error:
+                if attempt == 2:
+                    raise OSError("incomplete media download") from error
+        raise RuntimeError("media retry loop exhausted")
 
     def _client(self, intents: discord.Intents) -> discord.Client:
         client = discord.Client(intents=intents)

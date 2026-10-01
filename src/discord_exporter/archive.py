@@ -292,6 +292,15 @@ async def export_guild(
     manifest["status"] = "complete" if not incomplete_channels else "incomplete"
     _write_json(config.export_root / "manifest.json", manifest)
     _write_state_atomic(state_path, state)
+    progress.phase(f"Failure summary: {len(media_failures)} recorded")
+    if media_failures:
+        failure_counts: dict[tuple[str, str], int] = {}
+        for failure in media_failures:
+            key = (failure.get("operation", "unknown"), failure.get("error", "Error"))
+            failure_counts[key] = failure_counts.get(key, 0) + 1
+        for (operation, error), count in sorted(failure_counts.items()):
+            progress.phase(f"- {operation}: {error} ({count})")
+        progress.phase(f"Full failure details: {config.export_root / 'manifest.json'}")
 
 
 async def _with_retries[T](

@@ -946,7 +946,8 @@ def test_media_failures_are_durable_without_blocking_other_media_or_channels(
     source = FailedMediaGuildSource()
 
     asyncio.run(export_guild(config, source))
-    asyncio.run(export_guild(config, source))
+    progress = ProgressStream(tty=False)
+    asyncio.run(export_guild(config, source, progress))
 
     members = [
         json.loads(line) for line in (root / "members.jsonl").read_text().splitlines()
@@ -986,6 +987,10 @@ def test_media_failures_are_durable_without_blocking_other_media_or_channels(
     assert source.downloads.count("https://cdn.example/good") == 1
     assert source.downloads.count("https://cdn.example/avatar-bad") == 2
     assert source.downloads.count("https://cdn.example/message-bad") == 1
+    assert "Failure summary: 2 recorded" in progress.getvalue()
+    assert "- attachment: OSError (1)" in progress.getvalue()
+    assert "- avatar: OSError (1)" in progress.getvalue()
+    assert f"Full failure details: {root / 'manifest.json'}" in progress.getvalue()
 
 
 def test_exporting_channels_keeps_ids_stable_when_a_channel_is_renamed(
@@ -1214,8 +1219,8 @@ def test_exporting_messages_reports_replaceable_tty_channel_progress(
     asyncio.run(export_guild(config, MessageGuildSource(), progress))
 
     output = progress.getvalue()
-    assert output.count("\n") == 10
-    assert output.count("\r\033[2K") == 15
+    assert output.count("\n") == 11
+    assert output.count("\r\033[2K") == 16
     assert (
         "\r\033[2KChannel 1/2 (50%): general [100] — starting full history; 0 new messages"
         in output
@@ -1232,6 +1237,7 @@ def test_exporting_messages_reports_replaceable_tty_channel_progress(
         "\r\033[2KChannel 2/2 (100%): discussion [101] — complete; 0 new messages\n"
         in output
     )
+    assert output.endswith("\r\033[2KFailure summary: 0 recorded\n")
 
 
 def test_exporting_messages_reports_plain_progress_without_terminal_controls(

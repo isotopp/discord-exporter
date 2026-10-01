@@ -1,4 +1,5 @@
 import asyncio
+import http.client
 import io
 import urllib.request
 from types import SimpleNamespace
@@ -80,3 +81,26 @@ def test_media_download_has_a_socket_timeout(
 
     assert result == b"media"
     assert seen_timeout == [30]
+
+
+def test_media_download_retries_incomplete_responses_as_network_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def open_url(request: urllib.request.Request, timeout: float | None = None):
+        nonlocal attempts
+        attempts += 1
+        raise http.client.IncompleteRead(b"partial", 10)
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_url)
+    policy = RequestPolicy(0, 0, "test-agent")
+
+    with pytest.raises(OSError, match="incomplete media download"):
+        asyncio.run(
+            DiscordGuildSource("test-token", policy).download_media(
+                "https://cdn.example/media"
+            )
+        )
+
+    assert attempts == 3
